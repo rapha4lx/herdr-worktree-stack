@@ -1,0 +1,22 @@
+id = "wt-stack"
+name = "WT Stack"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Kill worktree docker stacks when herdr removes a worktree (label-based teardown, works after checkout removal)."
+platforms = ["linux"]
+
+[[events]]
+on = "worktree.removed"
+command = ["bash", "teardown.sh"]
+
+[[actions]]
+id = "down"
+title = "WT Stack: down (kill worktree containers)"
+contexts = ["workspace"]
+command = ["bash", "teardown.sh"]
+
+[[actions]]
+id = "info"
+title = "WT Stack: info (show worktree project containers)"
+contexts = ["workspace"]
+command = ["bash", "info.sh"]
