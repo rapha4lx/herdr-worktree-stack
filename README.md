@@ -1,10 +1,10 @@
-# herdr wt-stack
+# herdr worktree-stack
 
 Kill a git-worktree's docker stack when herdr removes the worktree.
 
 Removing a worktree (`herdr worktree remove` / `git worktree remove`) only
 deletes the git checkout. Docker containers, volumes and networks built from
-that worktree keep running forever — orphaned. `wt-stack` closes the loop:
+that worktree keep running forever — orphaned. `worktree-stack` closes the loop:
 when herdr emits `worktree.removed`, the plugin tears the worktree's compose
 stack down.
 
@@ -14,20 +14,20 @@ herdr fires `worktree.removed` **after** git removed the checkout, so
 `compose.yml`, overrides and `.env` no longer exist. You cannot run
 `docker compose -f ... down` anymore. Compose leaves project labels
 (`com.docker.compose.project=<project>`) on containers, volumes and networks,
-so `wt-stack` removes by label. No compose files needed.
+so `worktree-stack` removes by label. No compose files needed.
 
 ## Install
 
 Requires herdr ≥ 0.7.0 (Linux).
 
 ```bash
-herdr plugin install rapha4lx/herdr-wt-stack
+herdr plugin install rapha4lx/herdr-worktree-stack
 ```
 
 Or link a local checkout for development:
 
 ```bash
-herdr plugin link /path/to/herdr-wt-stack
+herdr plugin link /path/to/herdr-worktree-stack
 ```
 
 ## What it does
@@ -35,14 +35,14 @@ herdr plugin link /path/to/herdr-wt-stack
 - **Automatic**: on herdr event `worktree.removed`, removes the worktree's
   containers and network. **Volumes are kept** (your data is safe); set
   `WT_PURGE=1` to also remove volumes.
-- **Manual action** `wt-stack.down` — tear down the current workspace's stack
+- **Manual action** `worktree-stack.down` — tear down the current workspace's stack
   right now (workspace context).
-- **Manual action** `wt-stack.info` — list containers/volumes/networks for the
+- **Manual action** `worktree-stack.info` — list containers/volumes/networks for the
   current workspace's stack.
 
 ```bash
-herdr plugin action invoke wt-stack.down
-herdr plugin action invoke wt-stack.info
+herdr plugin action invoke worktree-stack.down
+herdr plugin action invoke worktree-stack.info
 ```
 
 ## Project matching
@@ -69,7 +69,7 @@ Both candidates are checked; any that exist are torn down; none = safe no-op.
 ## Development
 
 ```bash
-herdr plugin action list --plugin wt-stack   # registered actions
+herdr plugin action list --plugin worktree-stack   # registered actions
 herdr plugin log list                        # command logs
 ```
 

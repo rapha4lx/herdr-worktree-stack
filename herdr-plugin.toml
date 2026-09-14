@@ -1,22 +1,32 @@
-id = "wt-stack"
-name = "WT Stack"
-version = "0.1.0"
+id = "worktree-stack"
+name = "Worktree Stack"
+version = "0.3.0"
 min_herdr_version = "0.7.0"
-description = "Kill worktree docker stacks when herdr removes a worktree (label-based teardown, works after checkout removal)."
+description = "Auto-setup + teardown of worktree docker stacks: on worktree.created mounts the isolated compose stack (compose.worktree.yml + APP_HOST prefix), on worktree.removed kills it (label-based, works after checkout removal)."
 platforms = ["linux"]
+
+[[events]]
+on = "worktree.created"
+command = ["bash", "setup.sh"]
 
 [[events]]
 on = "worktree.removed"
 command = ["bash", "teardown.sh"]
 
 [[actions]]
+id = "up"
+title = "Worktree Stack: up (mount/ensure worktree stack)"
+contexts = ["workspace"]
+command = ["bash", "setup.sh"]
+
+[[actions]]
 id = "down"
-title = "WT Stack: down (kill worktree containers)"
+title = "Worktree Stack: down (kill worktree containers)"
 contexts = ["workspace"]
 command = ["bash", "teardown.sh"]
 
 [[actions]]
 id = "info"
-title = "WT Stack: info (show worktree project containers)"
+title = "Worktree Stack: info (show worktree project containers)"
 contexts = ["workspace"]
 command = ["bash", "info.sh"]
