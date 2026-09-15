@@ -1,29 +1,34 @@
 #!/usr/bin/env bash
-# wt-stack teardown — kill the docker stack of a worktree without compose files.
+# worktree-stack teardown — kill the docker stack of a worktree without compose files.
 #
 # Why label-based: herdr fires this on `worktree.removed`, AFTER git removed the
-# checkout, so compose.yml / compose.worktree.yml / .env are gone. Compose labels
-# (com.docker.compose.project=<project>) survive on containers/volumes/networks,
-# so we remove by project label instead of `docker compose ... down -f`.
+# checkout, so compose.yml / compose.worktree.yml / .env are gone. The compose
+# labels survive on the containers/networks, so we resolve the project FROM THE
+# LIVE CONTAINERS instead of guessing a name from the worktree path.
 #
-# Project matching (convention-agnostic, both supported):
-#   1. default docker compose project = worktree dir basename (no name: override)
-#   2. explicit `name: <repo>-<3chars>` where the worktree dir is `<3chars>-<repo>`
-#      (worktree `a3f-bayhub` -> project `bayhub-a3f`)
-# The script computes BOTH candidates from the worktree path and tears down any
-# that actually exist (no match = safe no-op).
+# Resolution (source of truth = running containers):
+#   1. worktree path from HERDR_PLUGIN_EVENT_JSON / HERDR_PLUGIN_CONTEXT_JSON.
+#   2. find containers whose label `com.docker.compose.project.working_dir`
+#      == that path. Every container `docker compose up`'d inside the worktree
+#      carries it, regardless of the `name:` used in compose.worktree.yml
+#      (huginn-wor, huginn-extract-9ca9, wallet-gateway-prod, ...) — so the
+#      naming contract never has to match a convention. No match = no-op.
+#   3. for each project found: `docker rm -f` every container with that
+#      project label, PLUS any container attached to the project's networks
+#      (orchestrator-spawned selenium/browser nodes use `docker run`, they have
+#      NO compose labels but join the project networks) — then remove the
+#      project networks.
+#   4. fallback (legacy): if no working_dir label matched, retry with the old
+#      basename candidates (basename + `3chars-rest` swap) so very old stacks
+#      still get cleaned.
 #
-# Inputs (herdr injects):
-#   event hook:  HERDR_PLUGIN_EVENT_JSON      (worktree.removed event payload)
-#   action:      HERDR_PLUGIN_CONTEXT_JSON    (workspace context)
-# Safety:
-#   containers + network always removed (that is what "remove worktree" means).
-#   VOLUMES (data) kept by default; set WT_PURGE=1 to also remove volumes.
+# Safety: containers + networks always removed ("remove worktree").
+# VOLUMES (data) kept by default; set WT_PURGE=1 to also remove volumes.
 set -euo pipefail
 
 json="${HERDR_PLUGIN_EVENT_JSON:-${HERDR_PLUGIN_CONTEXT_JSON:-}}"
 
-candidates="$(python3 - "$json" <<'PY'
+path="$(python3 - "$json" <<'PY'
 import json, os, sys
 raw = sys.argv[1]
 if not raw.strip():
@@ -41,52 +46,93 @@ def dig(paths):
         cur = cur[p]
     return cur
 
-wt = dig(["worktree"]) or dig(["params", "worktree"]) or dig(["result", "worktree"]) or {}
-path = (wt.get("path") or dig(["workspace", "cwd"]) or "").strip()
-if not path:
-    sys.exit(2)
-base = os.path.basename(path.rstrip("/")).lower()
+# herdr v0.9: EVENT_JSON = {"event":"worktree.removed","data":{"worktree":{"path":...}}}
+#             CONTEXT_JSON = {"worktree":{"checkout_path":...},"workspace_cwd":...}
+wt = dig(["data", "worktree"]) or dig(["worktree"]) or {}
+p = (wt.get("path") or wt.get("checkout_path") or dig(["workspace_cwd"]) or "").strip()
+print(p)
+PY
+)"
+if [ -z "$path" ]; then
+  echo "worktree-stack: no worktree path in event/context json"
+  exit 1
+fi
+base="$(basename "$(echo "$path" | sed 's#/$##')")"
+echo "worktree-stack: worktree path='$path' basename='$base'"
+
+# --- 1) resolve projects from live containers (source of truth) -------------
+projects="$(
+  for id in $(docker ps -aq --filter "label=com.docker.compose.project.working_dir=$path" 2>/dev/null || true); do
+    docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$id" 2>/dev/null
+  done | sort -u
+)"
+
+# --- fallback: old basename conventions (legacy stacks without the label) ---
+if [ -z "$projects" ]; then
+  echo "worktree-stack: no container matched working_dir='$path' — trying legacy basename candidates"
+  legacy="$(
+    python3 - "$base" <<'PY'
+import sys
+base = sys.argv[1].lower()
 out = {base}
-# convention <3chars>-<repo> -> project <repo>-<3chars>
 if "-" in base:
     first, _, rest = base.partition("-")
     if len(first) == 3 and rest:
         out.add(f"{rest}-{first}")
-for p in sorted(out):
-    print(p)
+print(" ".join(sorted(out)))
 PY
-)" && [ -n "$candidates" ] || { echo "wt-stack: no worktree path in event/context json"; exit 1; }
+  )"
+  for cand in $legacy; do
+    hit="$(docker ps -aq --filter "label=com.docker.compose.project=$cand" 2>/dev/null | head -1)"
+    [ -n "$hit" ] && projects="$projects $cand"
+  done
+  projects="$(printf '%s\n' $projects | sed '/^$/d' | sort -u)"
+fi
 
-echo "wt-stack: candidates=$candidates"
+if [ -z "$projects" ]; then
+  echo "worktree-stack: no docker resources matched (safe no-op)"
+  exit 0
+fi
 
-handled=0
-for project in $candidates; do
+echo "worktree-stack: projects=$projects"
+
+for project in $projects; do
+  echo "worktree-stack: tearing down project=$project"
+
+  # containers with the project label
   ids="$(docker ps -aq --filter "label=com.docker.compose.project=$project" 2>/dev/null || true)"
+  # project networks (also carry the project label) — by NAME: `network ls -q`
+  # returns short IDs, which `docker ps --filter network=` does not accept
+  nets="$(docker network ls --format '{{.Name}}' --filter "label=com.docker.compose.project=$project" 2>/dev/null || true)"
+
+  # docker-run stragglers: attached to this project's networks, no compose labels
+  stragglers=""
+  for net in $nets; do
+    for sid in $(docker ps -aq --filter "network=$net" 2>/dev/null || true); do
+      case " $ids " in
+        *" $sid "*) : ;;
+        *) stragglers="$stragglers $sid" ;;
+      esac
+    done
+  done
+  stragglers="$(printf '%s\n' $stragglers | sed '/^$/d' | sort -u)"
+
+  if [ -n "$ids" ] || [ -n "$stragglers" ]; then
+    docker rm -f $ids $stragglers >/dev/null 2>&1
+    echo "worktree-stack:   containers removed ($(printf '%s\n' $ids $stragglers | sed '/^$/d' | wc -l))"
+  fi
+
   vols="$(docker volume ls -q --filter "label=com.docker.compose.project=$project" 2>/dev/null || true)"
-  nets="$(docker network ls -q --filter "label=com.docker.compose.project=$project" 2>/dev/null || true)"
-  [ -z "$ids$vols$nets" ] && continue
-  handled=1
-  echo "wt-stack: tearing down project=$project"
-  if [ -n "$ids" ]; then
-    # shellcheck disable=SC2086
-    docker rm -f $ids
-    echo "wt-stack:   containers removed"
-  fi
   if [ "${WT_PURGE:-0}" = "1" ] && [ -n "$vols" ]; then
-    # shellcheck disable=SC2086
-    docker volume rm -f $vols
-    echo "wt-stack:   volumes removed (WT_PURGE=1)"
+    docker volume rm -f $vols >/dev/null 2>&1 || true
+    echo "worktree-stack:   volumes removed (WT_PURGE=1)"
   elif [ -n "$vols" ]; then
-    echo "wt-stack:   volumes KEPT (data safe; WT_PURGE=1 removes)"
+    echo "worktree-stack:   volumes KEPT (data safe; WT_PURGE=1 removes): $vols"
   fi
+
   if [ -n "$nets" ]; then
-    # shellcheck disable=SC2086
-    docker network rm $nets || true
-    echo "wt-stack:   network removed"
+    docker network rm $nets >/dev/null 2>&1 || true
+    echo "worktree-stack:   network(s) removed"
   fi
 done
-
-if [ "$handled" = "0" ]; then
-  echo "wt-stack: no docker resources matched candidates (safe no-op)"
-fi
-echo "wt-stack: done"
+echo "worktree-stack: done"

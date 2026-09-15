@@ -1,80 +1,22 @@
 # herdr worktree-stack
 
-Kill a git-worktree's docker stack when herdr removes the worktree.
+Auto-setup + teardown of git-worktree docker stacks.
 
-Removing a worktree (`herdr worktree remove` / `git worktree remove`) only
-deletes the git checkout. Docker containers, volumes and networks built from
-that worktree keep running forever — orphaned. `worktree-stack` closes the loop:
-when herdr emits `worktree.removed`, the plugin tears the worktree's compose
-stack down.
+When a worktree is created (`worktree.created`), `setup.sh` mounts an ISOLATED
+compose stack for it: project/containers named `<repo>-<tag>` (one tag per
+worktree, trailing hex of the dir name), networks from the base compose joined
+as `external: true` (shared incl. traefik_proxy), and Traefik label isolation —
+router names suffixed `-<tag>` with a worktree host `hostname-<tag>.<domain>`
+(needs wildcard DNS), so worktree and main stacks never collide. `.env` is
+copied from the main checkout when missing; APP_HOST gets `<tag>-` prefixed;
+a whitelist env-rewrite adapts CORS/URL/domain vars to the worktree host
+(identity-derived, nothing hardcoded); env changes force `--build` (inline of
+NEXT_PUBLIC/VITE vars). Published ports warn + `WT_PORT_SHIFT=<n>` remaps.
 
-## Why label-based teardown?
+When the worktree is removed (`worktree.removed`), `teardown.sh` kills the
+stack by compose project label (`com.docker.compose.project.working_dir` ==
+the removed worktree path) — works after git removed the checkout, no compose
+files needed.
 
-herdr fires `worktree.removed` **after** git removed the checkout, so
-`compose.yml`, overrides and `.env` no longer exist. You cannot run
-`docker compose -f ... down` anymore. Compose leaves project labels
-(`com.docker.compose.project=<project>`) on containers, volumes and networks,
-so `worktree-stack` removes by label. No compose files needed.
-
-## Install
-
-Requires herdr ≥ 0.7.0 (Linux).
-
-```bash
-herdr plugin install rapha4lx/herdr-worktree-stack
-```
-
-Or link a local checkout for development:
-
-```bash
-herdr plugin link /path/to/herdr-worktree-stack
-```
-
-## What it does
-
-- **Automatic**: on herdr event `worktree.removed`, removes the worktree's
-  containers and network. **Volumes are kept** (your data is safe); set
-  `WT_PURGE=1` to also remove volumes.
-- **Manual action** `worktree-stack.down` — tear down the current workspace's stack
-  right now (workspace context).
-- **Manual action** `worktree-stack.info` — list containers/volumes/networks for the
-  current workspace's stack.
-
-```bash
-herdr plugin action invoke worktree-stack.down
-herdr plugin action invoke worktree-stack.info
-```
-
-## Project matching
-
-The worktree directory name determines the docker project candidate(s):
-
-1. **Default compose naming** — project = worktree dir basename
-   (worktree dir `myapp` → project `myapp`).
-2. **`<repo>-<3chars>` convention** — when the worktree dir looks like
-   `<3chars>-<repo>` (first hyphen-separated segment is exactly 3 chars), the
-   project `name:` override is also matched:
-   worktree dir `a3f-bayhub` → project `bayhub-a3f`.
-
-Both candidates are checked; any that exist are torn down; none = safe no-op.
-
-## Safety
-
-- Containers + network are always removed when the worktree is removed.
-- Volumes (data) are kept by default. `WT_PURGE=1` removes them too.
-- The script is idempotent and only touches resources carrying the matching
-  `com.docker.compose.project` label.
-- The branch is never touched — herdr `worktree.remove` never deletes branches.
-
-## Development
-
-```bash
-herdr plugin action list --plugin worktree-stack   # registered actions
-herdr plugin log list                        # command logs
-```
-
-Manifest: [`herdr-plugin.toml`](./herdr-plugin.toml).
-
-## License
-
-Apache-2.0
+Install: `herdr plugin install rapha4lx/herdr-worktree-stack`
+Actions: `wt-stack.up` / `wt-stack.down` / `wt-stack.info`.

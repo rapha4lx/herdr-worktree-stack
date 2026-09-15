@@ -1,34 +1,44 @@
 #!/usr/bin/env bash
-# wt-stack info — show docker resources for a worktree project (candidates).
+# wt-stack info — show docker resources for the worktree of this workspace.
+# Same resolution as teardown.sh: find containers whose label
+# com.docker.compose.project.working_dir == workspace cwd (the current
+# worktree), then list every container of those projects.
 set -euo pipefail
 json="${HERDR_PLUGIN_CONTEXT_JSON:-}"
-candidates="$(python3 - "$json" <<'PY'
-import json, os, sys
+[ -n "$json" ] || { echo "wt-stack: no context json"; exit 1; }
+
+path="$(python3 - "$json" <<'PY'
+import json, sys
 raw = sys.argv[1]
-if not raw.strip():
-    sys.exit()
 try:
     d = json.loads(raw)
 except Exception:
     sys.exit(1)
-path = (d.get("workspace") or {}).get("cwd") or ""
-if not path:
-    sys.exit(2)
-base = os.path.basename(path.rstrip("/")).lower()
-out = {base}
-if "-" in base:
-    first, _, rest = base.partition("-")
-    if len(first) == 3 and rest:
-        out.add(f"{rest}-{first}")
-for p in sorted(out):
-    print(p)
+def dig(paths):
+    cur = d
+    for p in paths:
+        if not isinstance(cur, dict) or p not in cur:
+            return None
+        cur = cur[p]
+    return cur
+wt = dig(["worktree"]) or {}
+p = (wt.get("checkout_path") or dig(["workspace_cwd"]) or "").strip()
+print(p)
 PY
-)" || { echo "wt-stack: no workspace cwd in context json"; exit 1; }
+)"
+[ -n "$path" ] || { echo "wt-stack: no workspace cwd in context json"; exit 1; }
 
-echo "wt-stack: candidates=$candidates"
-for project in $candidates; do
-  ids="$(docker ps -aq --filter "label=com.docker.compose.project=$project" 2>/dev/null || true)"
-  [ -z "$ids" ] && continue
+projects="$(for id in $(docker ps -aq --filter "label=com.docker.compose.project.working_dir=$path" 2>/dev/null || true); do
+  docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$id" 2>/dev/null
+done | sort -u)"
+
+if [ -z "$projects" ]; then
+  echo "wt-stack: no containers matched working_dir='$path' (safe no-op)"
+  exit 0
+fi
+
+echo "wt-stack: projects=$projects"
+for project in $projects; do
   echo "-- project=$project containers --"
   docker ps -a --filter "label=com.docker.compose.project=$project" --format 'table {{.Names}}\t{{.Status}}' || true
 done
