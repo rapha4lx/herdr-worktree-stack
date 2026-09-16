@@ -58,11 +58,13 @@ set -euo pipefail
 DRY="${WT_DRY_RUN:-0}"
 BUILD="${WT_STACK_BUILD:-auto}"
 DIR=""
+FROM_PANE="${WT_FROM_PANE:-0}"
 
 # --- input resolution -------------------------------------------------------
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --cwd) DIR="$2"; shift 2 ;;
+    --from-pane) FROM_PANE=1; shift ;;
     *) shift ;;
   esac
 done
@@ -112,6 +114,57 @@ main_path="$(printf '%s\n' "$WT_LIST" | awk '/^worktree /{p=substr($0,10); if(!m
 in_list="$(printf '%s\n' "$WT_LIST" | awk -v d="$DIR" '$0=="worktree "d{found=1} END{print found+0}')"
 [ "$in_list" = "1" ] || { echo "wt-stack: $DIR not a registered worktree (skip)"; exit 0; }
 [ "$main_path" = "$DIR" ] && { echo "wt-stack: main checkout at $DIR (skip, no isolation needed)"; exit 0; }
+
+# --- delegate to the worktree's own pane (herdr event only) ------------------
+# When herdr fires `worktree.created`, THIS script runs in herdr's background
+# (output lands in `herdr plugin log`, the worktree console stays blank — the
+# user sees nothing). Instead: find the worktree's root pane in the herdr TUI
+# and run this script THERE via `herdr pane run`. The worktree console then
+# shows the whole setup live (build, networks, compose up, URLs) and stays
+# busy until the script returns. `--from-pane` marks the second invocation so
+# we don't re-delegate in a loop. Fallbacks: no herdr CLI → run in background
+# as before; already in the pane → run normally.
+if [ "$FROM_PANE" = "0" ] && [ -n "${HERDR_PLUGIN_EVENT_JSON:-}" ] && command -v herdr >/dev/null 2>&1; then
+  ws_id="$(python3 - "$json" <<'PY' 2>/dev/null || true
+import json, sys
+raw = sys.argv[1]
+try: d = json.loads(raw)
+except Exception: sys.exit()
+def dig(paths):
+    cur = d
+    for p in paths:
+        if not isinstance(cur, dict) or p not in cur: return None
+        cur = cur[p]
+    return cur
+for paths in (["data","workspace","workspace_id"], ["data","workspace","id"], ["workspace_id"]):
+    v = dig(paths)
+    if isinstance(v, str) and v.strip():
+        print(v.strip()); break
+PY
+)"
+  target=""
+  if [ -n "$ws_id" ]; then
+    target="$(herdr pane list --workspace "$ws_id" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    panes = d.get("result", {}).get("panes", [])
+    for p in panes:
+        if p.get("agent_status") in (None, "unknown", "idle"):
+            print(p.get("pane_id", "")); break
+    if not panes: print("")
+except Exception: pass' || true)"
+  fi
+  if [ -n "$target" ]; then
+    echo "wt-stack: delegating to worktree pane $target (wt-stack live in console)"
+    SCRIPT_ABS="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+    env WT_FROM_PANE=1 WT_STACK_BUILD="$BUILD" herdr pane run "$target" "bash '$SCRIPT_ABS' --cwd '$DIR' --from-pane" >/dev/null 2>&1 || true
+    echo "wt-stack: delegated (console pane $target is running the setup)"
+    exit 0
+  else
+    echo "wt-stack: no visible pane found (ws=$ws_id) — running in background"
+  fi
+fi
 
 base="$(basename "$DIR")"
 base_lc="${base,,}"
@@ -178,7 +231,11 @@ done < <(git -C "$main_path" ls-files --others --ignored --exclude-standard 2>/d
 
 # --- compose base -----------------------------------------------------------
 COMPOSE_BASE=""
-for f in compose.yml docker-compose.yml; do
+# prefer the generic names first, then the common explicit variants
+# (prod/local/devnet overrides — e.g. solana repo ships only
+# docker-compose.prod.yml / docker-compose.local.yml / docker-compose.devnet.yml)
+for f in compose.yml docker-compose.yml compose.prod.yml docker-compose.prod.yml \
+         compose.local.yml docker-compose.local.yml compose.devnet.yml docker-compose.devnet.yml; do
   [ -f "$DIR/$f" ] && { COMPOSE_BASE="$f"; break; }
 done
 if [ -z "$COMPOSE_BASE" ]; then
@@ -198,7 +255,8 @@ import json, sys, re
 fn = sys.argv[1]
 txt = open(fn, encoding="utf-8", errors="replace").read()
 lines = txt.split("\n")
-services, networks, routes, ports = [], [], {}, {}
+services, networks, external_nets, routes, ports = [], [], [], {}, {}
+containers, envs = {}, {}
 svc = section = None
 svc_re = re.compile(r"^  ([\w-]+):\s*$")
 sec_re = re.compile(r"^    ([\w-]+):\s*$")
@@ -216,6 +274,13 @@ for line in lines:
     if m:
         section = m.group(1)
         continue
+    # `container_name: X` is a service-level KEY with a VALUE (not a section —
+    # sec_re above requires `key:` + EOL), so it never matches sec_re; capture
+    # it directly.
+    m = re.match(r"^    container_name:\s*(\S+)\s*$", line)
+    if m and svc is not None:
+        containers[svc] = m.group(1)
+        continue
     if svc is None or section is None:
         continue
     if section == "ports":
@@ -226,19 +291,38 @@ for line in lines:
         if m:
             rtr, attr, val = m.group(1), m.group(2), m.group(3).rstrip('"').strip()
             routes[svc].setdefault(rtr, {})[attr] = val
-# top-level networks (2-space keys under `networks:`)
+    elif section == "environment":
+        # `      KEY: value` items under `environment:` (mapping form).
+        m = re.match(r'^\s{6}([^#][^:]*):\s*(.*)$', line)
+        if m:
+            envs.setdefault(svc, {})[m.group(1).strip()] = m.group(2).strip()
+# top-level networks (2-space keys under `networks:`; note the per-network
+# `external: <bool>` flag — external networks are SHARED infra (traefik_proxy
+# etc) and must stay external; owned networks are isolated per worktree).
 in_net = False
-for line in lines:
+for i, line in enumerate(lines):
     t = line
     if re.match(r"^networks:\s*$", t):
         in_net = True; continue
     if in_net:
         m = re.match(r"^  ([\w-]+):\s*$", t)
         if m:
-            networks.append(m.group(1)); continue
+            nt = m.group(1)
+            networks.append(nt)
+            # scan the network's block (4-space indented) for `external: true`
+            ext = False
+            for j in range(i + 1, len(lines)):
+                l = lines[j]
+                if l.startswith("    ") and re.search(r"external\s*:\s*true", l):
+                    ext = True; break
+                if l.strip() and not l.startswith("    "):
+                    break
+            if ext: external_nets.append(nt)
+            continue
         if t.strip() and not t.startswith(" "):
             in_net = False
-out = {"services": services, "networks": networks,
+out = {"services": services, "networks": networks, "external_networks": external_nets,
+       "containers": containers, "envs": envs,
        "routes": None, "ports": {s: p for s, p in ports.items() if p}}
 def host_of(rule):
     m = re.match(r"Host\(`([^`]+)`\)", rule or "")
@@ -261,10 +345,55 @@ if [ -z "$services" ]; then
   services="$(printf '%s' "$COMPOSE_META" | python3 -c 'import json,sys;print("\n".join(json.load(sys.stdin).get("services",[])))')"
 fi
 networks_list="$(printf '%s' "$COMPOSE_META" | python3 -c 'import json,sys;print("\n".join(json.load(sys.stdin).get("networks",[])))')"
+external_networks="$(printf '%s' "$COMPOSE_META" | python3 -c 'import json,sys;print("\n".join(json.load(sys.stdin).get("external_networks",[])))')"
 if [ -z "$services" ]; then
   echo "wt-stack: could not list services of $COMPOSE_BASE (skip override)"
   exit 0
 fi
+
+# --- env host rewrite for isolated worktree networks -------------------------
+# Owned (non-external) networks are re-created PER WORKTREE joined only by this
+# worktree's containers (isolation: no shared DNS namespace with main). So
+# environment values that reference the MAIN stack's container names (e.g.
+# `MINIO_ENDPOINT: huginn-minio:9000` -> this worktree's `huginn-extract-9ca9-minio:9000`)
+# MUST be rewritten, or they point at containers unreachable from the worktree
+# networks. Rewrite any occurrence of a main container_name in env values to
+# the worktree container_name. Emits TSV: svc<TAB>KEY<TAB>rewritten-value.
+ENV_REWRITE_TSV="$(python3 - "$project" "$COMPOSE_META" <<'PY'
+import json, re, sys
+project, meta = sys.argv[1], sys.argv[2]
+d = json.loads(meta)
+# map: main container_name -> worktree container_name (generated below as
+# <project>-<svc>); include the bare service name too (same DNS name).
+rew = {}
+for svc in d.get("services", []):
+    cn = (d.get("containers") or {}).get(svc) or svc
+    rew[cn] = f"{project}-{svc}"
+    rew[svc] = f"{project}-{svc}"
+# longest-first so `huginn-minio` wins over `minio` inside `huginn-minio:9000`
+order = sorted(rew, key=len, reverse=True)
+out = []
+for svc, env in (d.get("envs") or {}).items():
+    if not env:
+        continue
+    changed = {}
+    for k, v in env.items():
+        if not isinstance(v, str) or not v:
+            continue
+        nv = v
+        for name in order:
+            # whole-word-ish replace, BARE hostnames only: reject a following
+            # `.` (public FQDN — `minio.rafaelferro.dev` stays untouched; the
+            # label-host rewrite handles those), allow `:`/EOL/`/` after it.
+            nv = re.sub(r'(?<![A-Za-z0-9_.-])' + re.escape(name) + r'(?![A-Za-z0-9_.-])',
+                        rew[name], nv)
+        if nv != v:
+            changed[k] = nv
+    for k, nv in changed.items():
+        out.append(f"{svc}\t{k}\t{nv}")
+print("\n".join(out))
+PY
+)"
 
 # routes per service, TSV: svc<TAB>router<TAB>host<TAB>attr=val;attr=val...
 route_rows="$(printf '%s' "$COMPOSE_META" | python3 -c '
@@ -365,12 +494,34 @@ fi
         printf '    ports:\n      - "%s:%s"\n' "$nh" "$cp"
       done <<< "$port_rows"
     fi
+    # env host rewrite: point *_HOST/_URL/_ENDPOINT-style values at THIS
+    # worktree's own containers (`<project>-<svc>`, globally unique) instead
+    # of the main stack's `huginn-*` / bare service names. With isolated
+    # networks (below) the main containers are unreachable from the worktree
+    # networks, and unique container names also dodge DNS alias collisions on
+    # the shared traefik_proxy. Base `environment:` mapping values are
+    # re-emitted here only for keys whose value actually changed.
+    if [ -n "$ENV_REWRITE_TSV" ]; then
+      wt_env="$(printf '%s\n' "$ENV_REWRITE_TSV" | awk -F'\t' -v svc="$s" '$1==svc{printf "      %s: %s\n", $2, $3}')"
+      if [ -n "$wt_env" ]; then
+        printf '    environment:\n%s\n' "$wt_env"
+      fi
+    fi
   done <<< "$services"
-  # shared networks: join the MAIN stack's networks (incl. traefik_proxy)
-  # as external — don't try to own/recreate them. No warning, no rc=1.
+  # OWNED (non-external) networks are ISOLATED per worktree (`name:
+  # <project>_<net>`) so worktree containers never share a DNS namespace with
+  # the main stack (fixes the `postgres`/`redis`/`minio` alias collision —
+  # db-bootstrap migrated the WRONG postgres 2026-09-16). EXTERNAL networks
+  # (traefik_proxy, ...) stay shared so Traefik can route to the services.
   if [ -n "$networks_list" ]; then
     printf 'networks:\n'
-    while IFS= read -r nt; do printf '  %s:\n    external: true\n' "$nt"; done <<< "$networks_list"
+    while IFS= read -r nt; do
+      if printf '%s\n' "$external_networks" | grep -qx "$nt"; then
+        printf '  %s:\n    external: true\n' "$nt"
+      else
+        printf '  %s:\n    name: %s_%s\n' "$nt" "$project" "$nt"
+      fi
+    done <<< "$networks_list"
   fi
 } > "$OVERRIDE"
 echo "wt-stack: generated $OVERRIDE"
