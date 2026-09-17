@@ -29,10 +29,11 @@
 #      <project>_<key> (dump resolves implicit names — leaving them would MOUNT
 #      the main stack's volumes), owned networks re-scoped <project>_<net> (no
 #      DNS-alias collision), external networks kept (traefik_proxy).
-#   6. Prefix APP_HOST in .env with `<tag>-` if present and not prefixed.
-#      Fallback (no APP_HOST): derive a worktree host from the base compose
-#      Traefik labels — `Host(`foo.domain`)` -> `foo-<tag>.domain` (needs
-#      wildcard DNS, e.g. `*.rafaelferro.dev`) — re-emitted by gen-compose.py.
+#   6. Rewrite APP_HOST in .env via wt_host (append): `foo.domain` ->
+#      `foo-<tag>.domain` if present and not already suffixed.
+#      Fallback (no APP_HOST): derive worktree host from ANY Traefik
+#      Host() rule in the compose (prefers display_svc, falls back to first
+#      http route). If neither APP_HOST nor any route found -> hard error.
 #      URL = `https://foo-<tag>.domain`, printed as `wt-stack: URL=...`.
 #   7. Safety warnings (docker.sock/host-device/absolute binds), gentle orphan
 #      pre-clean (exited/dead containers + zero-attached networks of THIS
@@ -58,7 +59,7 @@
 #         else first 3 alnum chars of the dir basename (`wt-a3f` -> `a3f`)
 #         (herdr-v1 dir `<3chars>-<repo>`, `a3f-bayhub` -> tag `a3f`)
 #   project/id = `<repo_lc>-<tag>`  -> containers `huginn-extract-9ca9-backend`
-#   APP_HOST   = `<tag>-<orig>`     -> e.g. `9ca9-app.example.com`
+#   APP_HOST   = `<orig>-<tag>`     -> e.g. `app-9ca9.example.com` (wt_host append)
 # Teardown NEVER guesses the name: it resolves the project from the live
 # container label `com.docker.compose.project.working_dir` == worktree path
 # (teardown.sh in this same plugin dir). Naming is for humans/URLs only.
@@ -208,7 +209,7 @@ echo "wt-stack: worktree=$DIR project=$project tag=$tag main=$main_path"
 # --- copy .env from main checkout if missing --------------------------------
 # New worktrees don't ship `.env` (gitignored), so a fresh checkout has none.
 # Seed it from the main checkout when the main has one — NEVER overwrite an
-# existing worktree .env. The APP_HOST prefix step below then applies the
+# existing worktree .env. The APP_HOST rewrite step below then applies the
 # worktree tag to the copied file. Values may still need worktree-specific
 # edits (the copied main .env carries production secrets).
 ENV_FILE="$DIR/.env"
@@ -306,7 +307,11 @@ for s, d in svcs.items():
                 k, _, v = item.partition("=")
                 labdict[k] = v
     for k, v in labdict.items():
-        m = re.match(r"traefik\.http\.routers\.([\w.-]+)\.([\w.-]+)=(.*)$", k)
+        # NOTE: regex expects the FULL `key=value` — k alone (post-partition)
+        # never matches the `=(.*)$` tail, so routes were always empty. Rebuild
+        # the full string; val keeps the label value (quotes already stripped
+        # by yaml/dump), stripped of any remaining surrounding quotes.
+        m = re.match(r"traefik\.http\.routers\.([\w.-]+)\.([\w.-]+)=(.*)$", f"{k}={v}")
         if m:
             rtr, attr, val = m.group(1), m.group(2), m.group(3).strip().strip('"')
             routes.setdefault(s, {}).setdefault(rtr, {})[attr] = val
@@ -482,30 +487,53 @@ if ! ( cd "$DIR" && docker compose -f compose.worktree.yml config >/dev/null 2>&
   exit 1
 fi
 
-# --- APP_HOST prefix in .env ------------------------------------------------
+# --- APP_HOST rewrite in .env (wt_host — append: host-<tag>.domain) ----------
 FINAL_HOST=""
 ENV_HOST_ORIG=""
 if [ -f "$ENV_FILE" ] && grep -q '^APP_HOST=' "$ENV_FILE"; then
   cur="$(sed -n 's/^APP_HOST=//p' "$ENV_FILE" | head -1)"
-  ENV_HOST_ORIG="$(printf '%s' "$cur" | sed -E "s/^${tag}-//")"
+  # Idempotency: detect trailing -<tag> suffix (wt_host appends)
   case "$cur" in
-    "${tag}-"*) echo "wt-stack: APP_HOST already prefixed ($cur)"; FINAL_HOST="$cur" ;;
+    *"-${tag}".*|*"-${tag}")
+      # Already suffixed — strip the -<tag> (or -<tag>.domain) to recover orig
+      ENV_HOST_ORIG="$(printf '%s' "$cur" | sed -E "s/-${tag}(\\.|$)/\\1/")"
+      echo "wt-stack: APP_HOST already suffixed ($cur)"
+      FINAL_HOST="$cur" ;;
     "")
       echo "wt-stack: APP_HOST empty in .env (leave as-is)" ;;
     *)
-      sed -i.bak "s/^APP_HOST=.*/APP_HOST=${tag}-${cur}/" "$ENV_FILE" && rm -f "$ENV_FILE.bak"
-      echo "wt-stack: APP_HOST prefixed -> ${tag}-${cur}"
-      FINAL_HOST="${tag}-${cur}" ;;
+      ENV_HOST_ORIG="$cur"
+      new_host="$(wt_host "$cur" "$tag")"
+      sed -i.bak "s/^APP_HOST=.*/APP_HOST=${new_host}/" "$ENV_FILE" && rm -f "$ENV_FILE.bak"
+      echo "wt-stack: APP_HOST rewritten -> ${new_host}"
+      FINAL_HOST="${new_host}" ;;
   esac
 fi
 
-# labels fallback: no APP_HOST -> derive `hostname-<tag>.<domain>` from the
-# Traefik labels and surface it as the worktree URL (injected into the
-# override by the generation step above).
-if [ -z "$FINAL_HOST" ] && [ -n "$wt_display_svc" ] && [ -n "${wt_route[$wt_display_svc]+x}" ]; then
-  IFS='|' read -r _r _h _a <<< "${wt_route[$wt_display_svc]}"
-  FINAL_HOST="$(wt_host "$_h" "$tag")"
-  echo "wt-stack: Traefik host derived (no APP_HOST) -> $FINAL_HOST"
+# labels fallback: no APP_HOST -> derive `hostname-<tag>.<domain>` from ANY
+# Traefik Host() rule. Prefer display_svc (frontend-ish), else first routed svc.
+if [ -z "$FINAL_HOST" ]; then
+  # Try display_svc first, then iterate all routed services
+  _fallback_order=()
+  [ -n "$wt_display_svc" ] && _fallback_order+=("$wt_display_svc")
+  for _s in "${wt_svc_order[@]}"; do
+    [ "$_s" = "$wt_display_svc" ] && continue
+    _fallback_order+=("$_s")
+  done
+  for _s in "${_fallback_order[@]}"; do
+    [ -n "${wt_route[$_s]+x}" ] || continue
+    IFS='|' read -r _r _h _a <<< "${wt_route[$_s]}"
+    [ -n "$_h" ] || continue
+    FINAL_HOST="$(wt_host "$_h" "$tag")"
+    echo "wt-stack: Traefik host derived from svc=$_s (no APP_HOST) -> $FINAL_HOST"
+    break
+  done
+fi
+
+# Hard error: neither APP_HOST nor any Host() rule found
+if [ -z "$FINAL_HOST" ]; then
+  echo "wt-stack: ERROR no APP_HOST in .env and no Host() rule found — set APP_HOST=<your-domain> in .env (or add a Traefik Host() label)"
+  exit 1
 fi
 
 # --- env rewrite: adapt CORS/URL/domain vars to the worktree (whitelist) ----
@@ -586,7 +614,7 @@ fi
 # the bundle at build time; after a rewrite the image must be rebuilt for the
 # worktree URLs to take effect — even on a re-run.
 ENV_HASH_FILE="$DIR/.wt-stack.env-hash"
-ENV_HASH="$(sha256sum "$ENV_FILE" 2>/dev/null | cut -d' ' -f1)"
+ENV_HASH="$(sha256sum "$ENV_FILE" 2>/dev/null | cut -d' ' -f1 || true)"
 ENV_CHANGED=""
 if [ -n "$ENV_HASH" ]; then
   if [ ! -f "$ENV_HASH_FILE" ]; then
@@ -683,6 +711,29 @@ if [ "$n" -gt 0 ]; then
   echo "wt-stack: up ok — $n container(s) project=$project (compose rc=$rc)"
   [ -n "$FINAL_HOST" ] && echo "wt-stack: URL=https://$FINAL_HOST"
   [ -n "$ENV_HASH" ] && printf '%s' "$ENV_HASH" > "$ENV_HASH_FILE"
+
+  # --- TLS probe (non-blocking WARN) -----------------------------------------
+  # Probe the worktree URL via HTTPS; LE issuance may still be in progress on
+  # first deploy — retry up to 6 times (~30s total). Success -> OK; failure ->
+  # WARN with host + curl exit code + hint. NEVER blocks the script (exit 0).
+  if [ -n "$FINAL_HOST" ]; then
+    _tls_ok=0
+    for _attempt in 1 2 3 4 5 6; do
+      if curl -fsI --max-time 5 "https://$FINAL_HOST" >/dev/null 2>&1; then
+        _tls_ok=1
+        break
+      fi
+      [ "$_attempt" -lt 6 ] && sleep 5
+    done
+    if [ "$_tls_ok" = "1" ]; then
+      echo "wt-stack: OK TLS https://$FINAL_HOST valid"
+    else
+      _curl_rc=0
+      curl -fsI --max-time 5 "https://$FINAL_HOST" >/dev/null 2>&1 || _curl_rc=$?
+      echo "wt-stack: WARN TLS probe failed for https://$FINAL_HOST (curl exit=$_curl_rc) — Let's Encrypt issuance may still be in progress; retry in 30s"
+    fi
+  fi
+
   exit 0
 else
   echo "wt-stack: warning — no running container matched project=$project"

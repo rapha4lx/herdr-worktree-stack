@@ -26,7 +26,8 @@ compose stack for it: a complete standalone `compose.worktree.yml` is generated
 
 Base compose is NEVER part of `up` (single-file up), so its labels can never
 merge append-only back into the stack. `.env` is copied from the main checkout
-when missing; APP_HOST gets `<tag>-` prefixed; env values referencing main
+when missing; APP_HOST is rewritten via `wt_host` (append: `host-<tag>.domain`);
+env values referencing main
 container names are rewritten URL-safe (hostname after last `@` only — never
 userinfo/password); env changes force `--build` (inline of NEXT_PUBLIC/VITE
 vars). Before up: generated-file `docker compose config` validation, safety
