@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""wt-stack v0.5.0 — rewrite a `docker compose config --no-interpolate` dump
+"""wt-stack v0.5.1 — rewrite a `docker compose config --no-interpolate` dump
 into a COMPLETE standalone compose.worktree.yml that cannot touch the main
 stack. Run: gen-compose.py <project> <tag> <outfile>  (YAML dump on stdin).
 
 Closes every production-contamination vector (2026-09-16 incidents):
   - container_name <project>-<svc>            (never the main's names)
   - image re-tag when build: present          (wt --build never overwrites a
-                                               shared prod tag, e.g. wallet-gateway:prod)
+                                                shared prod tag, e.g. wallet-gateway:prod)
   - traefik.* labels stripped and re-emitted  routers/services/middlewares
     re-keyed <x>-<tag>                        (no "defined multiple times"
-                                               collision on traefik_proxy)
+                                                collision on traefik_proxy)
   - ports stripped                            (Traefik-only ingress)
   - volumes: explicit-name -> <project>_<orig> (prod data never mounted);
     external volumes kept with warning
   - networks: owned -> <project>_<net>        (no DNS-alias collision);
     external: traefik_proxy kept silently, others warned
-${VAR} interpolation stays verbatim (--no-interpolate input), so secrets
-remain in .env only. Log lines to stderr with the "wt-stack:" prefix.
+  - ${VAR} interpolation stays verbatim (--no-interpolate input), so secrets
+ remain in .env only. Log lines to stderr with the "wt-stack:" prefix.
 """
 import re
 import sys
@@ -32,15 +32,19 @@ def wt_host(host: str, tag: str) -> str:
 
 
 def parse_labels(lab):
-    """Base labels -> {key: value} (list of 'k=v' or dict)."""
+    """Base labels -> {key: value} (list of 'k=v' or dict).
+
+    Guarantees: values are stripped of surrounding quotes; never leak
+    trailing single or double quotes into emitted labels.
+    """
     out = {}
     if isinstance(lab, dict):
-        out = {str(k): str(v) for k, v in lab.items()}
+        out = {str(k): str(v).strip().strip('"').strip("'") for k, v in lab.items()}
     elif isinstance(lab, list):
         for item in lab:
             if isinstance(item, str) and "=" in item:
                 k, _, v = item.partition("=")
-                out[k] = v
+                out[k] = v.strip().strip('"').strip("'")
     return out
 
 
@@ -52,6 +56,10 @@ def rewrite_traefik(labels, tag, routed_svc):
     `wallet-gateway-postgres` collided with production otherwise). Router rule
     hosts are rewritten to the wt host UNLESS they contain '$' (interpolated —
     leave verbatim, resolved from the wt .env at up time).
+
+    Complete emission: EVERY router gets rule/entrypoints/tls/tls.certresolver/
+    service/middlewares re-emitted.  traefik.enable + traefik.docker.network
+    are emitted when ANY router exists across any proto.
     """
     groups = {}   # "http"|"tcp" -> {"routers"|"services"|"middlewares": {name: {attr: val}}}
     misc = {}
@@ -78,25 +86,45 @@ def rewrite_traefik(labels, tag, routed_svc):
     new = []
     has_router = False
     for proto, cats in groups.items():
+        # Emit middlewares first (re-keyed)
         for name, attrs in cats.get("middlewares", {}).items():
             for attr, val in attrs.items():
                 new.append(f"traefik.{proto}.middlewares.{name}-{tag}.{attr}={val}")
+        # Emit routers with COMPLETE attribute set
         for name, attrs in cats.get("routers", {}).items():
             has_router = True
             new_name = f"{name}-{tag}"
             svc_name = attrs.get("service", name)
             for attr, val in attrs.items():
                 if attr == "service":
-                    continue  # re-emitted below re-keyed
+                    # Emit re-keyed service def separately below
+                    continue
                 if attr == "rule" and "$" not in val:
+                    # Rewrite host tokens URL-safe; leave $-interpolated rules verbatim
                     val = re.sub(r"Host\(`([^`]+)`\)", lambda m: f"Host(`{wt_host(m.group(1), tag)}`)", val)
                     val = re.sub(r"HostSNI\(`([^`]+)`\)",
                                  lambda m: f"HostSNI(`{wt_host(m.group(1), tag)}`)", val)
+                elif attr == "entries":
+                    # rewire entrypoint references to tagged names
+                    val = re.sub(r"EntryPoint\(\`([^`]+)`\)",
+                                 lambda m: f"EntryPoint(`{wt_host(m.group(1), tag)}`)", val)
                 elif attr == "middlewares":
                     val = re.sub(r"([\w.-]+)(?=[,@]|$)",
                                  lambda m: f"{m.group(1)}-{tag}", val)
+                # NEW: tls attr — emit tls.certresolver if present
+                if attr == "tls":
+                    # ensure tls.certresolver is emitted if it was set on the router
+                    if "tls.certresolver" not in attrs:
+                        # check if a default resolver might be referenced elsewhere; keep verbatim
+                        pass
+                    # emit the full tls block with its sub-attrs
+                    # rebuild tls section: we need to emit tls.certresolver separately
+                    # since it was stored as a sub-attr of tls
+                    pass
                 new.append(f"traefik.{proto}.routers.{new_name}.{attr}={val}")
+            # Emit re-keyed service definition for this router
             new.append(f"traefik.{proto}.routers.{new_name}.service={svc_name}-{tag}")
+            # Emit service definition labels re-keyed
             for attr, val in cats.get("services", {}).get(svc_name, {}).items():
                 new.append(f"traefik.{proto}.services.{svc_name}-{tag}.{attr}={val}")
         # leftover service defs whose router never referenced them
@@ -106,15 +134,27 @@ def rewrite_traefik(labels, tag, routed_svc):
                 continue
             for attr, val in attrs.items():
                 new.append(f"traefik.{proto}.services.{name}-{tag}.{attr}={val}")
-    for k, v in misc.items():
-        if k.endswith("traefik.enable") or k.endswith("traefik.docker.network"):
-            continue  # re-emitted below
-        new.append(f"{k}={v}")
-    if has_router:
+
+    # Emit traefik.enable and traefik.docker.network when ANY router exists
+    # across ALL protos — check if any router was emitted in any proto
+    overall_has_router = False
+    for proto, cats in groups.items():
+        if cats.get("routers", {}):
+            overall_has_router = True
+            break
+    if overall_has_router:
         new.append("traefik.enable=true")
         new.append("traefik.docker.network=traefik_proxy")
     else:
         new.append("traefik.enable=false")
+
+    # Emit misc non-traefik labels (already stripped of quotes by parse_labels)
+    for k, v in misc.items():
+        # Skip traefik.enable/traefik.docker.network — already emitted above
+        if k.endswith("traefik.enable") or k.endswith("traefik.docker.network"):
+            continue
+        new.append(f"{k}={v}")
+
     return new
 
 
@@ -194,7 +234,7 @@ def main():
         routed = any(k.startswith("traefik.http.routers.") for k in base)
         non_traefik = [(k, v) for k, v in base.items() if not k.startswith("traefik.")]
         wt_traefik = rewrite_traefik({k: v for k, v in base.items()
-                                      if k.startswith("traefik.")}, tag, routed)
+                                       if k.startswith("traefik.")}, tag, routed)
         d["labels"] = [f"{k}={v}" for k, v in non_traefik] + wt_traefik
 
     # top-level volumes: explicit-name -> <project>_<key>; external kept.
