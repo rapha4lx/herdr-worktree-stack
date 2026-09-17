@@ -118,8 +118,14 @@ for project in $projects; do
   stragglers="$(printf '%s\n' $stragglers | sed '/^$/d' | sort -u)"
 
   if [ -n "$ids" ] || [ -n "$stragglers" ]; then
-    docker rm -f $ids $stragglers >/dev/null 2>&1
-    echo "worktree-stack:   containers removed ($(printf '%s\n' $ids $stragglers | sed '/^$/d' | wc -l))"
+    # dedupe: the project's own containers also sit on the project networks,
+    # so stragglers often duplicate ids — passing a container twice makes
+    # `docker rm` fail ("removal already in progress") and, with set -e, that
+    # aborted the script BEFORE networks/volumes/images were cleaned. Combine
+    # + dedupe, then force-remove.
+    all_ids="$(printf '%s\n' $ids $stragglers | sed '/^$/d' | sort -u)"
+    docker rm -f $all_ids >/dev/null 2>&1 || true
+    echo "worktree-stack:   containers removed ($(printf '%s\n' $all_ids | wc -l))"
   fi
 
   vols="$(docker volume ls -q --filter "label=com.docker.compose.project=$project" 2>/dev/null || true)"
@@ -133,6 +139,17 @@ for project in $projects; do
   if [ -n "$nets" ]; then
     docker network rm $nets >/dev/null 2>&1 || true
     echo "worktree-stack:   network(s) removed"
+  fi
+
+  # v0.5.0 image GC: remove the worktree's own images (re-tagged by
+  # gen-compose.py as <project>-<svc>:latest). `reference=<project>-*` —
+  # the trailing `-` after the project name guarantees we never match a
+  # sibling project (huginn-extract-9ca9 vs huginn-extract-9ca9abc). NEVER
+  # touches images the main stack uses (different names).
+  img_ids="$(docker images -q --filter "reference=${project}-*" 2>/dev/null | sort -u || true)"
+  if [ -n "$img_ids" ]; then
+    docker image rm -f $img_ids >/dev/null 2>&1 || true
+    echo "worktree-stack:   image(s) removed ($(printf '%s\n' $img_ids | wc -l))"
   fi
 done
 echo "worktree-stack: done"

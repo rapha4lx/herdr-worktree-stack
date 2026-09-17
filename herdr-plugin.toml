@@ -1,6 +1,6 @@
 id = "worktree-stack"
 name = "Worktree Stack"
-version = "0.4.3"
+version = "0.5.0"
 min_herdr_version = "0.7.0"
 description = "Auto-setup + teardown of worktree docker stacks: on worktree.created mounts the isolated compose stack (compose.worktree.yml + APP_HOST prefix), on worktree.removed kills it (label-based, works after checkout removal)."
 platforms = ["linux"]

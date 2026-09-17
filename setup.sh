@@ -15,21 +15,31 @@
 #      files don't ship with a fresh checkout). NEVER overwrites an existing
 #      worktree `.env`.
 #   4. Skip (safe no-op, exit 0) if the worktree has no base compose file.
-#   5. Generate compose.worktree.yml if missing: `name: <project>` +
-#      `container_name: <project>-<svc>` per service (services from
-#      `docker compose config --services`; fallback top-level key grep).
-#      Networks inherited from the base compose are declared `external: true`
-#      (worktree joins the SHARED networks — incl. traefik_proxy — without
-#      trying to own them; kills the "exists but was not created for project"
-#      warning / non-zero exit).
+#   5. Generate a COMPLETE standalone compose.worktree.yml (v0.5) from
+#      `docker compose config --no-interpolate` (canonical merged doc) via
+#      gen-compose.py (PyYAML hard requirement). Regenerated EVERY run — never
+#      an overlay, so the base compose's traefik.* labels can never merge
+#      append-only back into the stack. Per service: unique container_name
+#      <project>-<svc>, image re-tagged <project>-<svc>:latest when the base
+#      has `build:` (wt --build never overwrites shared prod tags), ALL base
+#      traefik.* labels stripped and re-emitted with router/service/middleware
+#      names re-keyed <x>-<tag> (http AND tcp; unrouted services get
+#      traefik.enable=false), published ports stripped, env values rewritten
+#      URL-safe (hostname after last '@' only). Top-level: volumes re-scoped
+#      <project>_<key> (dump resolves implicit names — leaving them would MOUNT
+#      the main stack's volumes), owned networks re-scoped <project>_<net> (no
+#      DNS-alias collision), external networks kept (traefik_proxy).
 #   6. Prefix APP_HOST in .env with `<tag>-` if present and not prefixed.
 #      Fallback (no APP_HOST): derive a worktree host from the base compose
 #      Traefik labels — `Host(`foo.domain`)` -> `foo-<tag>.domain` (needs
-#      wildcard DNS, e.g. `*.rafaelferro.dev`) — and inject a per-service
-#      overriding label into compose.worktree.yml (compose merges labels
-#      append-only; the later duplicate rule key wins in Traefik). URL =
-#      `https://foo-<tag>.domain`, printed as `wt-stack: URL=...`.
-#   7. `docker compose -f compose.yml -f compose.worktree.yml up -d [--build]`.
+#      wildcard DNS, e.g. `*.rafaelferro.dev`) — re-emitted by gen-compose.py.
+#      URL = `https://foo-<tag>.domain`, printed as `wt-stack: URL=...`.
+#   7. Safety warnings (docker.sock/host-device/absolute binds), gentle orphan
+#      pre-clean (exited/dead containers + zero-attached networks of THIS
+#      project), then SINGLE-FILE up:
+#      `docker compose --project-name "$project" -f compose.worktree.yml up -d
+#      [--build]` — base compose NEVER part of the command. Generated file is
+#      validated via `docker compose config` BEFORE up.
 #      WT_DRY_RUN=1 prints instead of touching docker (validation mode).
 #      Exit code: containers are ground truth — compose rc != 0 but project
 #      containers running still exits 0 (warnings, e.g. shared networks).
@@ -54,6 +64,11 @@
 # (teardown.sh in this same plugin dir). Naming is for humans/URLs only.
 
 set -euo pipefail
+
+# PyYAML hard requirement (validator#1) — fail loudly if missing
+python3 -c "import yaml" || { echo 'wt-stack: PyYAML required (pip install pyyaml / apt python3-yaml)'; exit 1; }
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo ".")"
 
 DRY="${WT_DRY_RUN:-0}"
 BUILD="${WT_STACK_BUILD:-auto}"
@@ -246,86 +261,71 @@ echo "wt-stack: base compose=$COMPOSE_BASE"
 
 OVERRIDE="$DIR/compose.worktree.yml"
 
-# --- parse base compose (agnostic helper) ------------------------------------
-# One python3 pass extracts everything the override needs, project-agnostic:
-#   services, top-level networks, per-service Traefik routers (attrs), and
-#   published ports. No hardcoded project knowledge.
-COMPOSE_META="$(python3 - "$DIR/$COMPOSE_BASE" <<'PY' 2>/dev/null || true
+# --- render base compose -> canonical merged YAML (single source of truth) ---
+# `docker compose config --no-interpolate` resolves override files, extends,
+# !reset/merge keys, multi-file -f a -f b. ${VAR} stays VERBATIM so secrets
+# never land in compose.worktree.yml (they stay in .env). This canonical doc
+# is BOTH the meta source and the rewrite input for the complete-compose dump.
+COMPOSE_DUMP="$( (cd "$DIR" && docker compose -f "$COMPOSE_BASE" config --no-interpolate 2>/dev/null) || true )"
+if [ -z "$COMPOSE_DUMP" ]; then
+  echo "wt-stack: could not render $COMPOSE_BASE via docker compose config (skip)"
+  exit 0
+fi
+
+# Extract the same meta schema the old regex parser produced (services,
+# top-level networks, per-service Traefik routers, published ports, container
+# names, env maps) — now from the merged canonical doc. Equal TSV/JSON shape so
+# the downstream sections (env rewrite, routes, ports, hosts) stay untouched.
+COMPOSE_META="$(python3 - "$project" "$COMPOSE_DUMP" <<'PY' 2>/dev/null || true
 import json, sys, re
-fn = sys.argv[1]
-txt = open(fn, encoding="utf-8", errors="replace").read()
-lines = txt.split("\n")
-services, networks, external_nets, routes, ports = [], [], [], {}, {}
-containers, envs = {}, {}
-svc = section = None
-svc_re = re.compile(r"^  ([\w-]+):\s*$")
-sec_re = re.compile(r"^    ([\w-]+):\s*$")
-port_re = re.compile(r'^\s{6}-\s*"?(\d+):([\d]+(?:/[a-z]+)?)"?\s*$')
-lab_re = re.compile(r'traefik\.http\.routers\.([\w.-]+)\.([\w.-]+)=(.+)')
-for line in lines:
-    m = svc_re.match(line)
-    if m:
-        svc = m.group(1); section = None
-        if svc not in routes: routes[svc] = {}
-        if svc not in ports: ports[svc] = []
-        services.append(svc)
-        continue
-    m = sec_re.match(line)
-    if m:
-        section = m.group(1)
-        continue
-    # `container_name: X` is a service-level KEY with a VALUE (not a section —
-    # sec_re above requires `key:` + EOL), so it never matches sec_re; capture
-    # it directly.
-    m = re.match(r"^    container_name:\s*(\S+)\s*$", line)
-    if m and svc is not None:
-        containers[svc] = m.group(1)
-        continue
-    if svc is None or section is None:
-        continue
-    if section == "ports":
-        m = port_re.match(line)
-        if m: ports[svc].append(f"{m.group(1)}:{m.group(2)}")
-    elif section == "labels":
-        m = lab_re.search(line)
+import yaml
+project, dump = sys.argv[1], sys.argv[2]
+doc = yaml.safe_load(dump) or {}
+svcs = doc.get("services") or {}
+services, networks, external_nets = [], [], []
+containers, envs, routes, ports = {}, {}, {}, {}
+for s, d in svcs.items():
+    services.append(s)
+    cn = d.get("container_name")
+    if cn: containers[s] = cn
+    env = d.get("environment")
+    if isinstance(env, dict):
+        envs[s] = {str(k): str(v) for k, v in env.items() if v is not None}
+    elif isinstance(env, list):
+        for item in env:
+            if isinstance(item, str) and "=" in item:
+                k, _, v = item.partition("=")
+                envs.setdefault(s, {})[k] = v
+    lab = d.get("labels")
+    labdict = {}
+    if isinstance(lab, dict):
+        labdict = {str(k): str(v) for k, v in lab.items()}
+    elif isinstance(lab, list):
+        for item in lab:
+            if isinstance(item, str) and "=" in item:
+                k, _, v = item.partition("=")
+                labdict[k] = v
+    for k, v in labdict.items():
+        m = re.match(r"traefik\.http\.routers\.([\w.-]+)\.([\w.-]+)=(.*)$", k)
         if m:
-            rtr, attr, val = m.group(1), m.group(2), m.group(3).rstrip('"').strip()
-            routes[svc].setdefault(rtr, {})[attr] = val
-    elif section == "environment":
-        # `      KEY: value` items under `environment:` (mapping form).
-        m = re.match(r'^\s{6}([^#][^:]*):\s*(.*)$', line)
-        if m:
-            envs.setdefault(svc, {})[m.group(1).strip()] = m.group(2).strip()
-# top-level networks (2-space keys under `networks:`; note the per-network
-# `external: <bool>` flag — external networks are SHARED infra (traefik_proxy
-# etc) and must stay external; owned networks are isolated per worktree).
-in_net = False
-for i, line in enumerate(lines):
-    t = line
-    if re.match(r"^networks:\s*$", t):
-        in_net = True; continue
-    if in_net:
-        m = re.match(r"^  ([\w-]+):\s*$", t)
-        if m:
-            nt = m.group(1)
-            networks.append(nt)
-            # scan the network's block (4-space indented) for `external: true`
-            ext = False
-            for j in range(i + 1, len(lines)):
-                l = lines[j]
-                if l.startswith("    ") and re.search(r"external\s*:\s*true", l):
-                    ext = True; break
-                if l.strip() and not l.startswith("    "):
-                    break
-            if ext: external_nets.append(nt)
-            continue
-        if t.strip() and not t.startswith(" "):
-            in_net = False
+            rtr, attr, val = m.group(1), m.group(2), m.group(3).strip().strip('"')
+            routes.setdefault(s, {}).setdefault(rtr, {})[attr] = val
+    plist = d.get("ports") or []
+    for p in plist:
+        if isinstance(p, dict) and p.get("published") is not None:
+            tgt = p.get("target", "")
+            ports.setdefault(s, []).append(f"{p['published']}:{tgt}")
+        elif isinstance(p, str):
+            ports.setdefault(s, []).append(p)
+for nt, nd in (doc.get("networks") or {}).items():
+    networks.append(nt)
+    if isinstance(nd, dict) and nd.get("external"):
+        external_nets.append(nt)
 out = {"services": services, "networks": networks, "external_networks": external_nets,
        "containers": containers, "envs": envs,
        "routes": None, "ports": {s: p for s, p in ports.items() if p}}
 def host_of(rule):
-    m = re.match(r"Host\(`([^`]+)`\)", rule or "")
+    m = re.match(r"Host\(\`([^\`]+)\`\)", rule or "")
     return m.group(1) if m else ""
 out["routes"] = {s: [{"router": r, "host": host_of(a.get("rule", "")), "attrs": a}
                      for r, a in rs.items() if "rule" in a]
@@ -334,7 +334,7 @@ json.dump(out, sys.stdout)
 PY
 )"
 if [ -z "$COMPOSE_META" ]; then
-  echo "wt-stack: could not parse $COMPOSE_BASE (skip override)"
+  echo "wt-stack: could not extract meta from $COMPOSE_BASE (skip)"
   exit 0
 fi
 
@@ -445,86 +445,29 @@ for s in "${wt_svc_order[@]}"; do
 done
 [ -z "$wt_display_svc" ] && [ "${#wt_svc_order[@]}" -gt 0 ] && wt_display_svc="${wt_svc_order[0]}"
 
-# port conflict handling: warn always; shift only when WT_PORT_SHIFT=<n> set
+# port conflict handling: v0.5 always STRIPS published ports (Traefik-only
+# ingress); gen-compose.py logs each removed port below.
 if [ -n "$port_rows" ]; then
-  if [ -n "${WT_PORT_SHIFT:-}" ]; then
-    echo "wt-stack: published ports found — shifting host ports by +$WT_PORT_SHIFT (WT_PORT_SHIFT)"
-  else
-    first_ports="$(printf '%s\n' "$port_rows" | head -1)"
-    echo "wt-stack: WARN published ports ($first_ports ...) — worktree will CONFLICT with main on host ports; set WT_PORT_SHIFT=<n> to remap"
-  fi
+  first_ports="$(printf '%s\n' "$port_rows" | head -1)"
+  echo "wt-stack: WARN published ports ($first_ports ...) — stripped from compose.worktree.yml (Traefik-only ingress)"
 fi
 
-# --- generate override (always — keeps in sync with base compose) ----------
-{
-  printf 'name: %s\nservices:\n' "$project"
-  while IFS= read -r s; do
-    printf '  %s:\n    container_name: %s-%s\n' "$s" "$project" "$s"
-    # Traefik isolation: router NAME suffixed with the worktree tag so main
-    # and worktree routers NEVER collide (the "HTTP router defined multiple
-    # times" failure seen 2026-09-15). All base router attrs are MIRRORED
-    # (rule host rewritten to the worktree host) — agnostic to entrypoints/
-    # certresolver/middlewares/tls/priority/...; service pinned if absent.
-    if [ -n "${wt_route[$s]+x}" ]; then
-      IFS='|' read -r rtr host attrs <<< "${wt_route[$s]}"
-      wt_rtr="${rtr}-${tag}"
-      wt_host_val="$(wt_host "$host" "$tag")"
-      {
-        printf '    labels:\n'
-        printf '      - "traefik.http.routers.%s.rule=Host(`%s`)"\n' "$wt_rtr" "$wt_host_val"
-        has_svc=0
-        if [ -n "$attrs" ]; then
-          while IFS= read -r av; do
-            [ -n "$av" ] || continue
-            a="${av%%=*}"; v="${av#*=}"
-            [ "$a" = "rule" ] && continue
-            [ "$a" = "service" ] && has_svc=1
-            printf '      - "traefik.http.routers.%s.%s=%s"\n' "$wt_rtr" "$a" "$v"
-          done <<< "${attrs//;/$'\n'}"
-        fi
-        [ "$has_svc" = "0" ] && printf '      - "traefik.http.routers.%s.service=%s"\n' "$wt_rtr" "$rtr"
-      }
-    fi
-    # published ports: remap host port when WT_PORT_SHIFT set
-    if [ -n "${WT_PORT_SHIFT:-}" ] && [ -n "$port_rows" ]; then
-      while IFS=$'\t' read -r ps ph; do
-        [ "$ps" = "$s" ] || continue
-        hp="${ph%%:*}"; cp="${ph#*:}"
-        nh=$((hp + WT_PORT_SHIFT))
-        printf '    ports:\n      - "%s:%s"\n' "$nh" "$cp"
-      done <<< "$port_rows"
-    fi
-    # env host rewrite: point *_HOST/_URL/_ENDPOINT-style values at THIS
-    # worktree's own containers (`<project>-<svc>`, globally unique) instead
-    # of the main stack's `huginn-*` / bare service names. With isolated
-    # networks (below) the main containers are unreachable from the worktree
-    # networks, and unique container names also dodge DNS alias collisions on
-    # the shared traefik_proxy. Base `environment:` mapping values are
-    # re-emitted here only for keys whose value actually changed.
-    if [ -n "$ENV_REWRITE_TSV" ]; then
-      wt_env="$(printf '%s\n' "$ENV_REWRITE_TSV" | awk -F'\t' -v svc="$s" '$1==svc{printf "      %s: %s\n", $2, $3}')"
-      if [ -n "$wt_env" ]; then
-        printf '    environment:\n%s\n' "$wt_env"
-      fi
-    fi
-  done <<< "$services"
-  # OWNED (non-external) networks are ISOLATED per worktree (`name:
-  # <project>_<net>`) so worktree containers never share a DNS namespace with
-  # the main stack (fixes the `postgres`/`redis`/`minio` alias collision —
-  # db-bootstrap migrated the WRONG postgres 2026-09-16). EXTERNAL networks
-  # (traefik_proxy, ...) stay shared so Traefik can route to the services.
-  if [ -n "$networks_list" ]; then
-    printf 'networks:\n'
-    while IFS= read -r nt; do
-      if printf '%s\n' "$external_networks" | grep -qx "$nt"; then
-        printf '  %s:\n    external: true\n' "$nt"
-      else
-        printf '  %s:\n    name: %s_%s\n' "$nt" "$project" "$nt"
-      fi
-    done <<< "$networks_list"
-  fi
-} > "$OVERRIDE"
-echo "wt-stack: generated $OVERRIDE"
+# --- generate COMPLETE compose.worktree.yml (v0.5: standalone, not overlay) -
+# `docker compose config --no-interpolate` dump (COMPOSE_DUMP) is rewritten by
+# gen-compose.py into a full standalone compose. The base compose is NEVER
+# part of `up` again — merging it back would re-add its traefik.* labels
+# append-only and re-collide with the main stack. gen-compose.py closes every
+# contamination vector (see its header): container_name, image re-tag for
+# local builds, traefik labels stripped + re-keyed (http AND tcp), ports
+# removed, explicit volumes/networks renamed.
+GEN_PY="$SELF_DIR/gen-compose.py"
+python3 "$GEN_PY" "$project" "$tag" "$OVERRIDE" <<PY 2>&1 | sed 's/^/wt-stack: /' >&2
+$COMPOSE_DUMP
+PY
+if [ ! -s "$OVERRIDE" ]; then
+  echo "wt-stack: gen-compose.py produced empty $OVERRIDE (abort)"
+  exit 1
+fi
 # ensure compose.worktree.yml is never accidentally committed (generated per worktree)
 if [ -f "$DIR/.gitignore" ] && ! grep -qxF 'compose.worktree.yml' "$DIR/.gitignore"; then
   printf '\n# worktree docker override (auto-generated by wt-stack)\ncompose.worktree.yml\n' >> "$DIR/.gitignore"
@@ -532,6 +475,11 @@ if [ -f "$DIR/.gitignore" ] && ! grep -qxF 'compose.worktree.yml' "$DIR/.gitigno
 elif [ ! -f "$DIR/.gitignore" ]; then
   printf '# worktree docker override (auto-generated by wt-stack)\ncompose.worktree.yml\n' > "$DIR/.gitignore"
   echo "wt-stack: created .gitignore with compose.worktree.yml"
+fi
+# validate BEFORE up — abort with clear error on malformed output
+if ! ( cd "$DIR" && docker compose -f compose.worktree.yml config >/dev/null 2>&1 ); then
+  echo "wt-stack: FAIL generated compose.worktree.yml does not parse — abort (check base compose for unsupported constructs)"
+  exit 1
 fi
 
 # --- APP_HOST prefix in .env ------------------------------------------------
@@ -673,13 +621,44 @@ case "$BUILD" in
     ;;
 esac
 
+# --- safety warnings (non-blocking) ------------------------------------------
+# Log-only guards for vectors that can't be auto-isolated: host-wide sockets,
+# host devices, absolute binds outside the worktree.
+python3 - "$DIR" "$COMPOSE_DUMP" <<'PY' 2>/dev/null || true
+import sys, yaml
+wt, dump = sys.argv[1], sys.argv[2]
+doc = yaml.safe_load(dump) or {}
+for s, d in (doc.get("services") or {}).items():
+    vols = d.get("volumes") or []
+    for v in vols:
+        src = ""
+        if isinstance(v, str): src = v.split(":", 1)[0]
+        elif isinstance(v, dict): src = str(v.get("source") or "")
+        if src in ("/var/run/docker.sock", "/dev", "/sys"):
+            sys.stderr.write(f"wt-stack: WARN {s} mounts host-wide: {src}\n")
+        elif src.startswith("/") and not src.startswith(wt):
+            sys.stderr.write(f"wt-stack: WARN {s} absolute bind outside worktree: {src}\n")
+PY
+
+# --- orphan pre-clean (this project only, gentle) -----------------------------
+# Stale exited/dead containers + networks with zero attached containers from
+# interrupted runs — NEVER a running container or an in-use network.
+for id in $(docker ps -aq --filter "status=exited" --filter "status=dead" --filter "label=com.docker.compose.project=$project" 2>/dev/null || true); do
+  docker rm "$id" >/dev/null 2>&1 || true
+  echo "wt-stack: removed stale container $id"
+done
+for net in $(docker network ls -q --filter "label=com.docker.compose.project=$project" 2>/dev/null || true); do
+  if [ -z "$(docker ps -aq --filter "network=$net" 2>/dev/null || true)" ]; then
+    docker network rm "$net" >/dev/null 2>&1 || true
+    echo "wt-stack: removed stale network $net"
+  fi
+done
+
 # --- bring up ---------------------------------------------------------------
-# Isolation guarantee: `--project-name "$project"` (CLI flag, highest
-# precedence) + override `name:` + `container_name:` per service — worktree
-# containers ALWAYS get unique names (project-<svc>), never collide with /
-# tear down the main checkout's containers. Verified via docker compose config
-# merge: override wins over base file for both name and container_name.
-up_cmd=(docker compose --project-name "$project" -f "$COMPOSE_BASE" -f compose.worktree.yml up -d)
+# v0.5: SINGLE-FILE up. The base compose is NEVER part of the command — merging
+# it back re-adds its traefik.* labels append-only and re-collides with the
+# main stack. compose.worktree.yml is complete (name + all services).
+up_cmd=(docker compose --project-name "$project" -f compose.worktree.yml up -d)
 [ "${#build_args[@]}" -gt 0 ] && up_cmd+=("${build_args[@]}")
 
 if [ "$DRY" = "1" ]; then
