@@ -1,11 +1,31 @@
 #!/usr/bin/env python3
-"""wt-stack v0.5.1 — rewrite a `docker compose config --no-interpolate` dump
+"""wt-stack v0.6.0 — rewrite a `docker compose config --no-interpolate` dump
 into a COMPLETE standalone compose.worktree.yml that cannot touch the main
 stack. Run: gen-compose.py <project> <tag> <outfile>  (YAML dump on stdin).
 
-Closes every production-contamination vector (2026-09-16 incidents):
-  - container_name <project>-<svc>            (never the main's names)
-  - image re-tag when build: present          (wt --build never overwrites a
+Closes every production-contamination vector (2026-09-16/17 incidents):
+  - service keys re-keyed <project>-<svc>      (Docker aliases EVERY service
+                                                by its key on EVERY joined
+                                                network — INCLUDING the shared
+                                                traefik_proxy. A worktree
+                                                keyed `postgres:` claimed the
+                                                alias `postgres` on
+                                                traefik_proxy and collided
+                                                with the MAIN stack's
+                                                postgres: main backend
+                                                resolved 2 IPs and
+                                                round-robined into the
+                                                worktree DB — UndefinedTable
+                                                outage 2026-09-17. Key ==
+                                                container name now, so no
+                                                short-name alias ever joins
+                                                traefik_proxy)
+  - internal refs remapped to the new keys:    depends_on, links, network
+                                                aliases, healthcheck targets,
+                                                env values (bare hostname,
+                                                userinfo@host, scheme://host)
+  - container_name <project>-<svc>             (never the main's names)
+  - image re-tag when build: present           (wt --build never overwrites a
                                                 shared prod tag, e.g. wallet-gateway:prod)
   - traefik.* labels stripped and re-emitted  routers/services/middlewares
     re-keyed <x>-<tag>                        (no "defined multiple times"
@@ -13,12 +33,16 @@ Closes every production-contamination vector (2026-09-16 incidents):
   - ports stripped                            (Traefik-only ingress)
   - volumes: explicit-name -> <project>_<orig> (prod data never mounted);
     external volumes kept with warning
-  - networks: owned -> <project>_<net>        (no DNS-alias collision);
-    external: traefik_proxy kept silently, others warned
+  - networks: owned -> <project>_<net>        (each worktree gets its own);
+    external: traefik_proxy kept silently, others warned. Service joins are
+    preserved (traefik_proxy: null stays — routing needs the join); explicit
+    aliases matching an old service key/container name are remapped to the
+    unique key
   - ${VAR} interpolation stays verbatim (--no-interpolate input), so secrets
- remain in .env only. Log lines to stderr with the "wt-stack:" prefix.
+    remain in .env only. Log lines to stderr with the "wt-stack:" prefix.
 """
 import re
+import shlex
 import sys
 
 import yaml
@@ -158,6 +182,133 @@ def rewrite_traefik(labels, tag, routed_svc):
     return new
 
 
+def remap_depends_on(d, svc_map):
+    """depends_on keys ARE compose service keys — rename them with the
+    service, or `docker compose config` fails on undefined services."""
+    dep = d.get("depends_on")
+    if isinstance(dep, dict):
+        d["depends_on"] = {svc_map.get(k, k): v for k, v in dep.items()}
+    elif isinstance(dep, list):
+        d["depends_on"] = [svc_map.get(x, x) for x in dep]
+
+
+def remap_links(d, host_map):
+    """links target a service key or container name (`svc` | `svc:alias`) —
+    the target token before ':' is the service ref, the alias part stays."""
+    lnk = d.get("links")
+    if not isinstance(lnk, list):
+        return
+    out = []
+    for item in lnk:
+        if not isinstance(item, str):
+            out.append(item)
+        elif ":" in item:
+            tgt, _, alias = item.partition(":")
+            out.append(f"{host_map.get(tgt, tgt)}:{alias}")
+        else:
+            out.append(host_map.get(item, item))
+    d["links"] = out
+
+
+def remap_network_aliases(d, host_map):
+    """Explicit per-network aliases equal to an old service key/container
+    name must become the unique key — Compose keeps the alias verbatim, so a
+    short name on traefik_proxy would re-collide with the main stack."""
+    nw = d.get("networks")
+    if not isinstance(nw, dict):
+        return
+    for nc in nw.values():
+        if isinstance(nc, dict) and isinstance(nc.get("aliases"), list):
+            nc["aliases"] = [host_map.get(a, a) for a in nc["aliases"]]
+
+
+# healthcheck rewrite: flag-aware so only HOST positions are touched. A bare
+# `postgres` after -h/--host/--hostname (or as an URL host) is the service DNS
+# name and must follow the rename; a value after -U/-d/-p (username, dbname,
+# password) is a credential and is NEVER rewritten.
+_HOST_FLAGS = {"-h", "--host", "--hostname"}
+_NONHOST_FLAGS = {
+    "-a", "-A", "-c", "-d", "-n", "-p", "-P", "-u", "-U", "-v", "-w", "-W",
+    "--command", "--dbname", "--no-password", "--password", "--prompt-password",
+    "--user", "--username",
+}
+
+
+def _hc_token(tok, host_map, host_next):
+    """Rewrite one healthcheck token; host_next=True means the previous token
+    was a host flag, so THIS bare token is hostname position. Returns
+    (new_tok, new_host_next)."""
+    if tok in _HOST_FLAGS:
+        return tok, True
+    if tok in _NONHOST_FLAGS:
+        return tok, False
+    if tok.startswith("--host="):
+        v = tok[len("--host="):]
+        return "--host=" + host_map.get(v, v), False
+    if tok.startswith("-h") and len(tok) > 2 and tok[2] != "-" and not tok[2].isdigit():
+        v = tok[2:]
+        return "-h" + host_map.get(v, v), False
+    m = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*://)([^/?:@]*)(.*)$", tok)
+    if m and m.group(2) in host_map:
+        return m.group(1) + host_map[m.group(2)] + m.group(3), False
+    if host_next:
+        return host_map.get(tok, tok), False
+    return tok, False
+
+
+def _shell_has_host_flag(cmd):
+    try:
+        toks = shlex.split(cmd)
+    except ValueError:
+        return False
+    return any(t in _HOST_FLAGS or t.startswith("--host=")
+               or (t.startswith("-h") and len(t) > 2 and t[2] != "-" and not t[2].isdigit())
+               for t in toks)
+
+
+def _rewrite_shell_cmd(cmd, host_map):
+    """CMD-SHELL form: one command string. Only touched when a host flag is
+    plainly present (never mangles `-U postgres` / `-d db` values on their
+    own); whitespace-tokenized with flag awareness, then rejoined."""
+    try:
+        toks = shlex.split(cmd)
+    except ValueError:
+        return cmd
+    out = []
+    host_next = False
+    for t in toks:
+        nv, host_next = _hc_token(t, host_map, host_next)
+        out.append(nv)
+    return " ".join(out)
+
+
+def remap_healthcheck(d, host_map):
+    """Healthchecks that probe a sibling service by its (now renamed) key
+    would fail DNS once the key-derived alias is gone. Rewrite host positions
+    only."""
+    hc = d.get("healthcheck")
+    if not isinstance(hc, dict):
+        return
+    test = hc.get("test")
+    if not isinstance(test, list):
+        return
+    out = []
+    host_next = False
+    for item in test:
+        if not isinstance(item, str):
+            out.append(item)
+            host_next = False
+            continue
+        if any(c in item for c in " \t"):
+            # CMD-SHELL — rewrite only when a host flag is clearly present
+            out.append(_rewrite_shell_cmd(item, host_map) if _shell_has_host_flag(item) else item)
+            host_next = False
+            continue
+        nv, host_next = _hc_token(item, host_map, host_next)
+        out.append(nv)
+    hc["test"] = out
+
+
 def main():
     if len(sys.argv) != 4:
         sys.stderr.write("usage: gen-compose.py <project> <tag> <outfile>\n")
@@ -166,42 +317,75 @@ def main():
     raw = sys.stdin.read()
     doc = yaml.safe_load(raw) or {}
     doc["name"] = project
-    svcs = doc.get("services") or {}
+    raw_svcs = doc.get("services") or {}
 
-    # hostname rewrite map: service key AND base container_name -> the wt
-    # container's DNS name (<project>-<svc>). Only exact bare-hostname tokens
-    # are rewritten (URL-safe: hostname after last '@', bounded by :/?); URL
-    # userinfo/password and values containing '$' (interpolation) are left
-    # untouched — ${VAR} stays verbatim and resolves from the wt .env at up.
+    # --- service key rename: `svc` -> `<project>-<svc>` ----------------------
+    # Docker Compose auto-aliases EVERY service by its key on EVERY joined
+    # network — INCLUDING the shared traefik_proxy. A worktree service keyed
+    # `postgres` therefore claimed the alias `postgres` on traefik_proxy,
+    # colliding with the MAIN stack's postgres (same alias): the main backend
+    # (POSTGRES_HOST=postgres) got TWO DNS answers and round-robined into the
+    # worktree DB (UndefinedTable outage 2026-09-17). Re-keying removes the
+    # default alias entirely: key == container_name == one unique DNS name.
+    svc_map = {}   # old key -> new key
+    for s in raw_svcs:
+        new_key = f"{project}-{s}"
+        if s.startswith(project + "-"):
+            new_key = s      # idempotency guard: never double-prefix
+        svc_map[s] = new_key
+
+    # hostname rewrite map: old service key, base container_name, AND the new
+    # key all -> the new key (new == container_name == one DNS name). The
+    # self-entries make the rewrite idempotent: already-rewritten values match
+    # and stay put.
     host_map = {}
-    for s, d in svcs.items():
-        host_map[s] = f"{project}-{s}"
+    for s, d in raw_svcs.items():
+        new_key = svc_map[s]
+        host_map[s] = new_key
+        host_map[new_key] = new_key
         cn = (d.get("container_name") or "").strip()
         if cn:
-            host_map[cn] = f"{project}-{s}"
+            host_map[cn] = new_key
+
+    doc["services"] = {svc_map[s]: raw_svcs[s] for s in raw_svcs}
 
     def rewrite_env_value(v):
+        # Bare hostname tokens in env values -> the wt DNS name. Host
+        # position: after the last '@' (URL userinfo), else after an optional
+        # scheme://, else at the start; bounded by / : ? — NEVER touches URL
+        # userinfo/password. Values containing '$' (interpolation) are left
+        # verbatim — ${VAR} resolves from the wt .env at up.
         if not isinstance(v, str) or not v or "$" in v:
             return v
         out = v
         for name in sorted(host_map, key=len, reverse=True):
             repl = host_map[name]
-            if "@" in out:
-                head, _, tail = out.rpartition("@")
-                m = re.match(r"^([^/?:]*)([/?:].*)?$", tail)
-                hostpart = m.group(1) if m else tail
-                if hostpart == name:
-                    out = head + "@" + repl + tail[len(hostpart):]
-            else:
-                m = re.match(r"^([^/?:]*)([/?:].*)?$", out)
-                hostpart = m.group(1) if m else out
-                if hostpart == name:
-                    out = repl + (m.group(2) if m and m.group(2) else "")
+            head = ""
+            tail = out
+            if "@" in tail:
+                h, _, t = tail.rpartition("@")
+                head, tail = h + "@", t
+            scheme = ""
+            m = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", tail)
+            if m:
+                scheme = m.group(0)
+                tail = tail[m.end():]
+            m = re.match(r"^([^/?:]*)([/?:].*)?$", tail)
+            hostpart = m.group(1) if m else tail
+            if hostpart == name:
+                out = head + scheme + repl + (m.group(2) if m and m.group(2) else "")
         return out
 
     removed_ports = []
-    for s, d in svcs.items():
-        d["container_name"] = f"{project}-{s}"
+    for s, d in raw_svcs.items():
+        # key == container_name: the wt container's only DNS name is the
+        # unique <project>-<svc> — no short-name alias anywhere.
+        d["container_name"] = svc_map[s]
+        # internal references that point at a service by its (renamed) key
+        remap_depends_on(d, svc_map)
+        remap_links(d, host_map)
+        remap_network_aliases(d, host_map)
+        remap_healthcheck(d, host_map)
         # image re-tag: local builds only
         if "build" in d:
             old = d.get("image")
@@ -213,8 +397,8 @@ def main():
             del d["ports"]
         # env host rewrite: bare service/container hostnames in plain env values
         # -> <project>-<svc> (isolated networks can't resolve the main's names).
-        # URL-safe: hostname token only after the last '@', bounded by :/? —
-        # NEVER touches URL userinfo/password.
+        # URL-safe: hostname token only after the last '@' / optional scheme,
+        # bounded by :/? — NEVER touches URL userinfo/password.
         env = d.get("environment")
         if isinstance(env, dict):
             for k, v in list(env.items()):

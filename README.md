@@ -8,7 +8,14 @@ compose stack for it: a complete standalone `compose.worktree.yml` is generated
 (PyYAML required). Every production-contamination vector is closed:
 
 - **containers/networks**: project `<repo>-<tag>` (one tag per worktree,
-  trailing hex of the dir name); owned networks re-scoped
+  trailing hex of the dir name); **service keys AND container names are
+  `<project>-<svc>`** (never the short name). Docker Compose auto-aliases
+  every service by its service key on every joined network — so a worktree
+  keyed `postgres:` claimed the alias `postgres` on the shared `traefik_proxy`
+  and collided with the MAIN stack's postgres (main backend resolved 2 IPs and
+  round-robined into the worktree DB, UndefinedTable outage 2026-09-17). With
+  the unique key, no short-name alias ever joins `traefik_proxy` and DNS
+  collision with main is impossible. Owned networks re-scoped
   `<project>_<net>` — worktree never shares a DNS namespace with main (kills
   the `postgres`/`redis`/`minio` alias collision that let db-bootstrap migrate
   the WRONG postgres 2026-09-16). External networks (traefik_proxy) kept.
@@ -27,10 +34,11 @@ compose stack for it: a complete standalone `compose.worktree.yml` is generated
 Base compose is NEVER part of `up` (single-file up), so its labels can never
 merge append-only back into the stack. `.env` is copied from the main checkout
 when missing; APP_HOST is rewritten via `wt_host` (append: `host-<tag>.domain`);
-env values referencing main
-container names are rewritten URL-safe (hostname after last `@` only — never
-userinfo/password); env changes force `--build` (inline of NEXT_PUBLIC/VITE
-vars). Before up: generated-file `docker compose config` validation, safety
+env values
+referencing main container names or service keys are rewritten to the
+worktree DNS name (bare hostname, `user@host` and `scheme://host` forms —
+never userinfo/password); env changes force `--build` (inline of
+NEXT_PUBLIC/VITE vars). Before up: generated-file `docker compose config` validation, safety
 warnings (docker.sock/host-device/absolute binds), orphan pre-clean
 (exited/dead containers + zero-attached networks of this project only).
 
