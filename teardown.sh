@@ -26,6 +26,15 @@
 # VOLUMES (data) kept by default; set WT_PURGE=1 to also remove volumes.
 set -euo pipefail
 
+# --- structured logging (same convention as setup.sh) -----------------------
+# Terminal shows short notes; command output (docker rm/network/volume/image)
+# goes to the per-worktree log file /tmp/wt-stack-<tag>.log (tag = trailing
+# hex of the worktree dir basename) for later analysis.
+LOG_FILE="/tmp/wt-stack.log"
+wt_note()  { printf 'worktree-stack: %s\n' "$*"; [ -n "$LOG_FILE" ] && printf '%s [info] %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"; }
+wt_ok()    { printf '      → %s\n' "$*"; [ -n "$LOG_FILE" ] && printf '%s [ok] %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"; }
+wt_trace() { [ -n "$LOG_FILE" ] && printf '%s [trace] %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"; }
+
 json="${HERDR_PLUGIN_EVENT_JSON:-${HERDR_PLUGIN_CONTEXT_JSON:-}}"
 
 path="$(python3 - "$json" <<'PY'
@@ -54,11 +63,16 @@ print(p)
 PY
 )"
 if [ -z "$path" ]; then
-  echo "worktree-stack: no worktree path in event/context json"
+  wt_note "no worktree path in event/context json"
   exit 1
 fi
 base="$(basename "$(echo "$path" | sed 's#/$##')")"
-echo "worktree-stack: worktree path='$path' basename='$base'"
+# resolve tag the same way setup.sh does (trailing hex token) for the log file
+base_tag="${base,,}"; base_tag="${base_tag##*-}"
+if printf '%s' "$base_tag" | grep -qE '^[0-9a-f]{3,}$'; then tag="$base_tag"; else tag="wt"; fi
+LOG_FILE="/tmp/wt-stack-${tag}.log"
+wt_trace "=== wt-stack teardown base=$base path=$path"
+wt_note "teardown worktree path='$path' basename='$base' (log: $LOG_FILE)"
 
 # --- 1) resolve projects from live containers (source of truth) -------------
 # NOTE: `docker inspect` MUST be guarded with `|| true`. Under set -euo
@@ -77,7 +91,7 @@ projects="$(
 
 # --- fallback: old basename conventions (legacy stacks without the label) ---
 if [ -z "$projects" ]; then
-  echo "worktree-stack: no container matched working_dir='$path' — trying legacy basename candidates"
+  wt_note "no container matched working_dir='$path' — trying legacy basename candidates"
   legacy="$(
     python3 - "$base" <<'PY'
 import sys
@@ -98,14 +112,14 @@ PY
 fi
 
 if [ -z "$projects" ]; then
-  echo "worktree-stack: no docker resources matched (safe no-op)"
+  wt_note "no docker resources matched (safe no-op)"
   exit 0
 fi
 
-echo "worktree-stack: projects=$projects"
+wt_note "projects=$projects"
 
 for project in $projects; do
-  echo "worktree-stack: tearing down project=$project"
+  wt_note "tearing down project=$project"
 
   # containers with the project label
   ids="$(docker ps -aq --filter "label=com.docker.compose.project=$project" 2>/dev/null || true)"
@@ -133,22 +147,22 @@ for project in $projects; do
     # + dedupe, then force-remove.
     all_ids="$(printf '%s\n' $ids $stragglers | sed '/^$/d' | sort -u)"
     docker rm -f $all_ids >/dev/null 2>&1 || true
-    echo "worktree-stack:   containers removed ($(printf '%s\n' $all_ids | wc -l))"
+    wt_note "  containers removed ($(printf '%s\n' $all_ids | wc -l))"
   fi
 
   vols="$(docker volume ls -q --filter "label=com.docker.compose.project=$project" 2>/dev/null || true)"
   if [ "${WT_PURGE:-0}" = "1" ] && [ -n "$vols" ]; then
     docker volume rm -f $vols >/dev/null 2>&1 || true
-    echo "worktree-stack:   volumes removed (WT_PURGE=1)"
+    wt_note "  volumes removed (WT_PURGE=1)"
   elif [ -n "$vols" ]; then
-    echo "worktree-stack:   volumes KEPT (data safe; WT_PURGE=1 removes): $vols"
+    wt_note "  volumes KEPT (data safe; WT_PURGE=1 removes): $vols"
   fi
 
   if [ -n "$nets" ]; then
     if docker network rm $nets >/dev/null 2>&1; then
-      echo "worktree-stack:   network(s) removed"
+      wt_ok "network(s) removed"
     else
-      echo "worktree-stack:   WARN network(s) NOT removed (still in use?): $nets"
+      wt_note "WARN network(s) NOT removed (still in use?): $nets"
     fi
   fi
 
@@ -160,10 +174,10 @@ for project in $projects; do
   img_ids="$(docker images -q --filter "reference=${project}-*" 2>/dev/null | sort -u || true)"
   if [ -n "$img_ids" ]; then
     if docker image rm -f $img_ids >/dev/null 2>&1; then
-      echo "worktree-stack:   image(s) removed ($(printf '%s\n' $img_ids | wc -l))"
+      wt_ok "image(s) removed ($(printf '%s\n' $img_ids | wc -l))"
     else
-      echo "worktree-stack:   WARN image(s) NOT removed: $(printf '%s\n' $img_ids | wc -l)"
+      wt_note "WARN image(s) NOT removed: $(printf '%s\n' $img_ids | wc -l)"
     fi
   fi
 done
-echo "worktree-stack: done"
+wt_ok "done"
