@@ -249,6 +249,20 @@ else
   wt_note "no .env in main or worktree (skip)"
 fi
 
+# --- worktree orchestrator URL (legacy HTTP path) ----------------------------
+# The base compose's ORCHESTRATOR_URL is interpolatable since PR #117; the
+# bare `orchestrator` hostname never exists inside a worktree stack, so point
+# at THIS project's own orchestrator container. Only appended when unset, so
+# an operator override survives.
+if [ -f "$ENV_FILE" ] && ! grep -qE '^ORCHESTRATOR_URL=' "$ENV_FILE"; then
+  {
+    printf '\n# Worktree-scoped orchestrator (legacy HTTP path) — added by wt-stack\n'
+    printf 'ORCHESTRATOR_URL=http://%s-orchestrator:8000\n' "$project"
+    printf 'VM_ORCHESTRATOR_URL=http://%s-orchestrator:8000\n' "$project"
+  } >> "$ENV_FILE"
+  wt_note "appended ORCHESTRATOR_URL=http://${project}-orchestrator:8000 to .env"
+fi
+
 # --- copy common gitignored runtime files from main checkout ----------------
 # Fresh worktrees ship TRACKED files only. Gitignored runtime files (`.env*`,
 # `certs/*.crt|*.key`, ...) must come from the main checkout or services crash
@@ -785,8 +799,15 @@ if "orchestrator" in svcs and isinstance(svcs["orchestrator"], dict):
         "DOCKER_NETWORK": f"{project}_internal_net",
         "DOCKER_EGRESS_NETWORK": f"{project}_scraping_net",
         "REDIS_HOST": f"{project}-redis",
+        # Pool connect goes to THIS worktree's own backend (BACKEND_WS_URL).
+        # ORCHESTRATOR_CONNECT_TOKEN is deliberately NOT injected: the copied
+        # main-checkout .env token belongs to the MAIN backend's orchestrators
+        # table and has no row in this worktree's DB, so injecting it makes
+        # every worktree orchestrator 403-loop (invalid_token) forever. With
+        # no env token the orchestrator falls into 0032 first-contact
+        # registration (Pending <machine_id>) and receives its OWN one-shot
+        # token after an admin approves it in this worktree's backend.
         "BACKEND_WS_URL": "${BACKEND_WS_URL:-}",
-        "ORCHESTRATOR_CONNECT_TOKEN": "${ORCHESTRATOR_CONNECT_TOKEN:-}",
     })
 nets = doc.setdefault("networks", {})
 for alias, key in (("orchestrator_net", f"{project}_orchestrator_vm_net"),
