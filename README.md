@@ -48,5 +48,33 @@ the removed worktree path) — works after git removed the checkout, no compose
 files needed — and GCs the project's own images (`<project>-*`). Volumes only
 with `WT_PURGE=1`; external volumes/networks are NEVER touched.
 
+## Worktree orchestrator (app-repo-owned compose)
+
+Some app repos ship their own orchestrator compose
+(`docker-compose.orchestrator.yml` + a `compose.worktree.orchestrator.yml`
+overlay). Those overlays historically use GLOBAL FIXED names
+(project/container/networks/volumes `*-wor-orchestrator*`), so a SECOND
+worktree collided on the same names and silently never got an orchestrator
+(sessions needing a browser never provisioned). `setup.sh` now generates a
+tag-scoped override `compose.worktree.orchestrator.<tag>.yml` (gitignored) and
+ups it with project `<project>-orchestrator` **inside the worktree dir**:
+
+- container/hostname `<project>-orchestrator`; networks
+  `<project>_orchestrator_{vm,browser}_net` + `<project>_internal_net`
+  (external: the app stack owns it); volumes
+  `<project>_orchestrator_{iso_cache,conf}`.
+- env rewired to THIS worktree: `HUB_URL`/`REDIS_HOST` -> `<project>-hub` /
+  `<project>-redis`, `DOCKER_VM_NETWORK`/`DOCKER_BROWSER_NETWORK` ->
+  `<project>_orchestrator_*_net`, `DOCKER_NETWORK`/`DOCKER_EGRESS_NETWORK` ->
+  `<project>_internal_net` / `<project>_scraping_net`,
+  `BACKEND_WS_URL`/`ORCHESTRATOR_CONNECT_TOKEN` from the worktree's `.env`.
+- validated with `docker compose config` before `up`; WARNs (never blocks) on
+  failure; prints the command under `WT_DRY_RUN=1`. Skip entirely with
+  `WT_NO_ORCHESTRATOR=1`.
+
+Teardown already catches the orchestrator: it resolves containers by the
+`working_dir` label, and the orchestrator is up'd from inside the worktree
+dir.
+
 Install: `herdr plugin install rapha4lx/herdr-worktree-stack`
 Actions: `wt-stack.up` / `wt-stack.down` / `wt-stack.info`.

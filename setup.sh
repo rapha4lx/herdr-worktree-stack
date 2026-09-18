@@ -712,6 +712,91 @@ if [ "$n" -gt 0 ]; then
   [ -n "$FINAL_HOST" ] && echo "wt-stack: URL=https://$FINAL_HOST"
   [ -n "$ENV_HASH" ] && printf '%s' "$ENV_HASH" > "$ENV_HASH_FILE"
 
+  # --- worktree orchestrator: tag-scoped isolation override + up --------------
+  # Some app repos ship their own orchestrator compose (`docker-compose.orchestrator.yml`
+  # + an overlay). Those overlays historically use GLOBAL FIXED names
+  # (project/container/networks/volumes `*-wor-orchestrator*`), so a SECOND
+  # worktree collides on the same names and never gets an orchestrator. Generate
+  # a tag-scoped override that renames every owned resource to
+  # `<project>-orchestrator` / `<project>_orchestrator_*` and rewires the
+  # internal refs to THIS worktree's hub/redis/networks (and `.env`'s
+  # BACKEND_WS_URL / ORCHESTRATOR_CONNECT_TOKEN), validate, then up it INSIDE
+  # the worktree dir — teardown.sh's label resolution (working_dir) picks it up
+  # automatically. Escape hatch: WT_NO_ORCHESTRATOR=1 skips entirely.
+  ORCH_BASE="$DIR/docker-compose.orchestrator.yml"
+  ORCH_OVERLAY="$DIR/compose.worktree.orchestrator.yml"
+  ORCH_ISOLATE="$DIR/compose.worktree.orchestrator.$tag.yml"
+  if [ -f "$ORCH_BASE" ] && [ -f "$ORCH_OVERLAY" ] && [ -z "${WT_NO_ORCHESTRATOR:-}" ]; then
+    if python3 - "$project" "$ORCH_BASE" "$ORCH_OVERLAY" "$ORCH_ISOLATE" <<'PY'
+import sys
+import yaml
+project, base, overlay, out = sys.argv[1:5]
+base = yaml.safe_load(open(base)) or {}
+doc = yaml.safe_load(open(overlay)) or {}
+svcs = doc.setdefault("services", {})
+if "orchestrator" in svcs and isinstance(svcs["orchestrator"], dict):
+    svc = svcs["orchestrator"]
+    svc["container_name"] = f"{project}-orchestrator"
+    svc["hostname"] = f"{project}-orchestrator"
+    env = svc.setdefault("environment", {})
+    if isinstance(env, list):
+        env = {str(x).partition("=")[0]: str(x).partition("=")[2]
+               for x in env if "=" in str(x)}
+        svc["environment"] = env
+    env.update({
+        "HUB_URL": f"http://{project}-hub:4444",
+        "DOCKER_VM_NETWORK": f"{project}_orchestrator_vm_net",
+        "DOCKER_BROWSER_NETWORK": f"{project}_orchestrator_browser_net",
+        "DOCKER_NETWORK": f"{project}_internal_net",
+        "DOCKER_EGRESS_NETWORK": f"{project}_scraping_net",
+        "REDIS_HOST": f"{project}-redis",
+        "BACKEND_WS_URL": "${BACKEND_WS_URL:-}",
+        "ORCHESTRATOR_CONNECT_TOKEN": "${ORCHESTRATOR_CONNECT_TOKEN:-}",
+    })
+nets = doc.setdefault("networks", {})
+for alias, key in (("orchestrator_net", f"{project}_orchestrator_vm_net"),
+                   ("orchestrator_browser_net", f"{project}_orchestrator_browser_net"),
+                   ("internal_net", f"{project}_internal_net")):
+    if alias in nets and isinstance(nets[alias], dict):
+        nets[alias]["name"] = key
+        nets[alias]["external"] = True  # owned by the worktree stack project
+vols = doc.setdefault("volumes", {})
+for alias, key in (("orchestrator_iso_cache", f"{project}_orchestrator_iso_cache"),
+                   ("orchestrator_conf", f"{project}_orchestrator_conf")):
+    if alias in vols and isinstance(vols[alias], dict):
+        vols[alias]["name"] = key
+with open(out, "w") as f:
+    yaml.safe_dump(doc, f, sort_keys=False)
+print(f"wt-stack: orchestrator isolate override -> {out}")
+PY
+    then
+      if [ "$DRY" = "1" ]; then
+        echo "wt-stack: WT_DRY_RUN=1 — would run:"
+        echo "  cd $DIR && docker compose -p $project-orchestrator -f $ORCH_BASE -f $ORCH_OVERLAY -f $ORCH_ISOLATE up -d"
+      elif ( cd "$DIR" && docker compose -p "$project-orchestrator" \
+             -f docker-compose.orchestrator.yml \
+             -f compose.worktree.orchestrator.yml \
+             -f "$ORCH_ISOLATE" config --quiet >/dev/null 2>&1 ); then
+        if ( cd "$DIR" && docker compose -p "$project-orchestrator" \
+             -f docker-compose.orchestrator.yml \
+             -f compose.worktree.orchestrator.yml \
+             -f "$ORCH_ISOLATE" up -d >/dev/null 2>&1 ); then
+          echo "wt-stack: orchestrator up (project=$project-orchestrator)"
+        else
+          _orch_rc=$?
+          echo "wt-stack: WARN orchestrator up failed (rc=$_orch_rc) — worktree sessions needing a browser will not provision"
+        fi
+      else
+        echo "wt-stack: WARN orchestrator compose config invalid (skip up) — check $ORCH_OVERLAY vs $ORCH_BASE"
+      fi
+    else
+      echo "wt-stack: WARN could not generate orchestrator isolate override (skip)"
+    fi
+  fi
+  [ -n "$ORCH_ISOLATE" ] && [ -f "$DIR/.gitignore" ] && \
+    grep -qxF "compose.worktree.orchestrator.$tag.yml" "$DIR/.gitignore" || \
+    printf 'compose.worktree.orchestrator.%s.yml\n' "$tag" >> "$DIR/.gitignore"
+
   # --- TLS probe (non-blocking WARN) -----------------------------------------
   # Probe the worktree URL via HTTPS; LE issuance may still be in progress on
   # first deploy — retry up to 6 times (~30s total). Success -> OK; failure ->
