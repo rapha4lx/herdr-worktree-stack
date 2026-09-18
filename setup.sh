@@ -762,51 +762,113 @@ if [ "$n" -gt 0 ]; then
   ORCH_OVERLAY="$DIR/compose.worktree.orchestrator.yml"
   ORCH_ISOLATE="$DIR/compose.worktree.orchestrator.$tag.yml"
   if [ -f "$ORCH_BASE" ] && [ -f "$ORCH_OVERLAY" ] && [ -z "${WT_NO_ORCHESTRATOR:-}" ]; then
-    if python3 - "$project" "$ORCH_BASE" "$ORCH_OVERLAY" "$ORCH_ISOLATE" <<'PY'
-import sys
-import yaml
-project, base, overlay, out = sys.argv[1:5]
-base = yaml.safe_load(open(base)) or {}
-doc = yaml.safe_load(open(overlay)) or {}
+    # GENERIC — no per-app names: every service/network/volume is re-scoped to
+    # <project>-<svc> / <project>_<net> and every env value is re-run through
+    # the app stack's OWN service/network names (the overlay may be stale:
+    # `foo-<oldtag>-hub`, `foo-wor-hub`, even bare `hub`) so internal refs
+    # point at THIS worktree. Works for any second-compose-project the app
+    # ships (orchestrator, worker, sidecar…).
+    if python3 - "$project" "$repo_lc" "$tag" "$ORCH_BASE" "$ORCH_OVERLAY" "$OVERRIDE" "$ORCH_ISOLATE" <<'PY'
+import re, sys, yaml
+project, repo, tag, base_path, overlay_path, stack_path, out = sys.argv[1:8]
+doc = yaml.safe_load(open(overlay_path)) or {}
+stack = yaml.safe_load(open(stack_path)) or {}
+base_doc = yaml.safe_load(open(base_path)) or {} if False else yaml.safe_load(open(base_path)) or {}
+
+# ensure networks/volumes the overlay leaves to the base compose are ALSO
+# re-scoped (a base-only network would keep its global name and collide
+# between worktrees). Merge base defs in; the rename loop below rewrites them.
+_doc_nets = doc.setdefault("networks", {})
+for alias, d in (base_doc.get("networks") or {}).items():
+    _doc_nets.setdefault(alias, d)
+_doc_vols = doc.setdefault("volumes", {})
+for alias, d in (base_doc.get("volumes") or {}).items():
+    _doc_vols.setdefault(alias, d)
+
+# 1) every service gets a unique <project>-<svc> name (container + hostname)
 svcs = doc.setdefault("services", {})
-if "orchestrator" in svcs and isinstance(svcs["orchestrator"], dict):
-    svc = svcs["orchestrator"]
-    svc["container_name"] = f"{project}-orchestrator"
-    svc["hostname"] = f"{project}-orchestrator"
-    env = svc.setdefault("environment", {})
+renamed = {}
+for s, d in list(svcs.items()):
+    if not isinstance(d, dict):
+        continue
+    old = d.get("container_name")
+    d["container_name"] = f"{project}-{s}"
+    if d.get("hostname"):
+        d["hostname"] = f"{project}-{s}"
+    if old:
+        renamed[old] = f"{project}-{s}"
+
+# 2) networks re-scoped to <project>_<alias>; owned ones are created by this
+#    compose (no external — cold worktree), external ones join the app stack
+#    (the stack up already created <project>_<alias>).
+nets = doc.setdefault("networks", {})
+net_renames = {}
+for alias, d in list(nets.items()):
+    if not isinstance(d, dict):
+        continue
+    old = d.get("name", alias)
+    new = f"{project}_{alias}"
+    net_renames[old] = new
+    d["name"] = new
+    if not d.get("external"):
+        d.pop("external", None)
+
+# 3) volumes re-scoped the same way
+vols = doc.setdefault("volumes", {})
+vol_renames = {}
+for alias, d in list(vols.items()):
+    if not isinstance(d, dict):
+        continue
+    old = d.get("name", alias)
+    new = f"{project}_{alias}"
+    vol_renames[old] = new
+    d["name"] = new
+
+# 4) env values rewired purely from the app stack's OWN names — any reference
+#    to a stack service/network (whatever repo/tag prefix it carries) becomes
+#    <project>-<svc> / <project>_<net>.
+svc_suffixes = sorted(
+    {k[len(project) + 1:] for k in (stack.get("services") or {})
+     if k.startswith(project + "-")},
+    key=len, reverse=True)
+net_suffixes = sorted(
+    {k[len(project) + 1:] for k in (stack.get("networks") or {})
+     if k.startswith(project + "_")},
+    key=len, reverse=True)
+
+def rewire(value):
+    s = str(value)
+    for old, new in (list(net_renames.items()) + list(vol_renames.items())
+                     + list(renamed.items())):
+        if old and old != new:
+            s = s.replace(old, new)
+    # generic prefix rule: any <repo>-<hex> / <repo>_<hex> reference (stale
+    # tag inside the app's own versioned overlay) -> this project. Covers
+    # values that reference runtime-created names (not part of the stack).
+    if repo and tag:
+        s = re.sub(rf"(?<![\w.-]){re.escape(repo)}-[0-9a-f]{{2,10}}(?=[\w.-])",
+                   f"{project}", s)
+        s = re.sub(rf"(?<![\w.-]){re.escape(repo)}_[0-9a-f]{{2,10}}(?=[\w.-])",
+                   f"{project}", s)
+    for svc in svc_suffixes:
+        pat = rf"(?<![\w.-])(?:[a-z0-9_.-]+[-_.])?{re.escape(svc)}(?![\w.-])"
+        s = re.sub(pat, f"{project}-{svc}", s)
+    for net in net_suffixes:
+        pat = rf"(?<![\w.-])(?:[a-z0-9_.-]+[-_.])?{re.escape(net)}(?![\w.-])"
+        s = re.sub(pat, f"{project}_{net}", s)
+    return s
+
+for s, d in (doc.get("services") or {}).items():
+    if not isinstance(d, dict):
+        continue
+    env = d.get("environment")
     if isinstance(env, list):
         env = {str(x).partition("=")[0]: str(x).partition("=")[2]
                for x in env if "=" in str(x)}
-        svc["environment"] = env
-    env.update({
-        "HUB_URL": f"http://{project}-hub:4444",
-        "DOCKER_VM_NETWORK": f"{project}_orchestrator_vm_net",
-        "DOCKER_BROWSER_NETWORK": f"{project}_orchestrator_browser_net",
-        "DOCKER_NETWORK": f"{project}_internal_net",
-        "DOCKER_EGRESS_NETWORK": f"{project}_scraping_net",
-        "REDIS_HOST": f"{project}-redis",
-        "BACKEND_WS_URL": "${BACKEND_WS_URL:-}",
-        "ORCHESTRATOR_CONNECT_TOKEN": "${ORCHESTRATOR_CONNECT_TOKEN:-}",
-    })
-nets = doc.setdefault("networks", {})
-for alias, key in (("orchestrator_net", f"{project}_orchestrator_vm_net"),
-                   ("orchestrator_browser_net", f"{project}_orchestrator_browser_net"),
-                   ("internal_net", f"{project}_internal_net")):
-    if alias in nets and isinstance(nets[alias], dict):
-        nets[alias]["name"] = key
-        # orchestration vm/browser nets: OWNED, created by this compose —
-        # no external (cold worktree would fail: network not yet created).
-        # internal_net only: the app-stack up already created it, so it's
-        # external (we JOIN it, don't own it).
-        if alias == "internal_net":
-            nets[alias]["external"] = True
-        else:
-            nets[alias].pop("external", None)  # ensure no stale external flag
-vols = doc.setdefault("volumes", {})
-for alias, key in (("orchestrator_iso_cache", f"{project}_orchestrator_iso_cache"),
-                   ("orchestrator_conf", f"{project}_orchestrator_conf")):
-    if alias in vols and isinstance(vols[alias], dict):
-        vols[alias]["name"] = key
+        d["environment"] = env
+    if isinstance(env, dict):
+        d["environment"] = {k: rewire(v) for k, v in env.items() if v is not None}
+
 with open(out, "w") as f:
     yaml.safe_dump(doc, f, sort_keys=False)
 print(f"wt-stack: orchestrator isolate override -> {out}")
