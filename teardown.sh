@@ -61,9 +61,17 @@ base="$(basename "$(echo "$path" | sed 's#/$##')")"
 echo "worktree-stack: worktree path='$path' basename='$base'"
 
 # --- 1) resolve projects from live containers (source of truth) -------------
+# NOTE: `docker inspect` MUST be guarded with `|| true`. Under set -euo
+# pipefail, a single inspect failure inside the command substitution (race:
+# container removed between `ps` and `inspect`, daemon hiccup) makes the
+# pipeline fail and ABORTS the whole script silently before any cleanup runs
+# — seen live as 3 teardown failures with stdout cut after
+# "tearing down project=…" (exit 1, no stderr → herdr shows "action
+# rejected"). Guard keeps the loop resilient: a missed inspect just skips
+# that container.
 projects="$(
   for id in $(docker ps -aq --filter "label=com.docker.compose.project.working_dir=$path" 2>/dev/null || true); do
-    docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$id" 2>/dev/null
+    docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$id" 2>/dev/null || true
   done | sort -u
 )"
 
@@ -137,8 +145,11 @@ for project in $projects; do
   fi
 
   if [ -n "$nets" ]; then
-    docker network rm $nets >/dev/null 2>&1 || true
-    echo "worktree-stack:   network(s) removed"
+    if docker network rm $nets >/dev/null 2>&1; then
+      echo "worktree-stack:   network(s) removed"
+    else
+      echo "worktree-stack:   WARN network(s) NOT removed (still in use?): $nets"
+    fi
   fi
 
   # v0.5.0 image GC: remove the worktree's own images (re-tagged by
@@ -148,8 +159,11 @@ for project in $projects; do
   # touches images the main stack uses (different names).
   img_ids="$(docker images -q --filter "reference=${project}-*" 2>/dev/null | sort -u || true)"
   if [ -n "$img_ids" ]; then
-    docker image rm -f $img_ids >/dev/null 2>&1 || true
-    echo "worktree-stack:   image(s) removed ($(printf '%s\n' $img_ids | wc -l))"
+    if docker image rm -f $img_ids >/dev/null 2>&1; then
+      echo "worktree-stack:   image(s) removed ($(printf '%s\n' $img_ids | wc -l))"
+    else
+      echo "worktree-stack:   WARN image(s) NOT removed: $(printf '%s\n' $img_ids | wc -l)"
+    fi
   fi
 done
 echo "worktree-stack: done"
