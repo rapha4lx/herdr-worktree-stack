@@ -759,7 +759,14 @@ for alias, key in (("orchestrator_net", f"{project}_orchestrator_vm_net"),
                    ("internal_net", f"{project}_internal_net")):
     if alias in nets and isinstance(nets[alias], dict):
         nets[alias]["name"] = key
-        nets[alias]["external"] = True  # owned by the worktree stack project
+        # orchestration vm/browser nets: OWNED, created by this compose —
+        # no external (cold worktree would fail: network not yet created).
+        # internal_net only: the app-stack up already created it, so it's
+        # external (we JOIN it, don't own it).
+        if alias == "internal_net":
+            nets[alias]["external"] = True
+        else:
+            nets[alias].pop("external", None)  # ensure no stale external flag
 vols = doc.setdefault("volumes", {})
 for alias, key in (("orchestrator_iso_cache", f"{project}_orchestrator_iso_cache"),
                    ("orchestrator_conf", f"{project}_orchestrator_conf")):
