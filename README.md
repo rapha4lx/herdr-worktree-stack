@@ -76,5 +76,26 @@ Teardown already catches the orchestrator: it resolves containers by the
 `working_dir` label, and the orchestrator is up'd from inside the worktree
 dir.
 
+## Dev Data Seeding (`seed.sh`)
+
+When a worktree mounts for the first time, `setup.sh` invokes `seed.sh` to copy
+dev data from the ORIGIN checkout's running stack (`main_path`).
+
+- **Services**: `postgres`, `redis`, `minio` (only those declared in the worktree's `compose.worktree.yml`).
+- **Main stack is READ-ONLY**: Never modifies, creates, or stops origin containers. Origin containers are discovered via labels (`com.docker.compose.project.working_dir=$main_path` and `com.docker.compose.service=$svc`).
+- **Pipes & Non-destructive**:
+  - `postgres`: `pg_dump -Fc` on origin piped directly into `pg_restore` on worktree destination.
+  - `redis`: `BGSAVE` on origin (never blocks event loop), polls `LASTSAVE`, stops worktree redis container, copies `dump.rdb` into destination volume, restarts destination.
+  - `minio`: transient `minio/mc` mirror container attached to both project networks.
+- **Empty-check**: By default, seeding skips if destination already contains data.
+- **Non-fatal**: Any failure in seeding logs a warning and exits 0; the worktree stack remains usable.
+
+### Configuration & Control Variables
+
+- `WT_SEED=0`: Disables auto-seeding on mount (default: `1`).
+- `WT_SEED_TARGETS="postgres redis minio"`: Whitespace-separated list of services to seed.
+- `WT_SEED_FORCE=1`: Forces re-seeding even if destination data already exists.
+- `WT_SEED_TIMEOUT=300`: Maximum duration per service in seconds (default: `300`).
+
 Install: `herdr plugin install rapha4lx/herdr-worktree-stack`
-Actions: `wt-stack.up` / `wt-stack.down` / `wt-stack.info`.
+Actions: `wt-stack.up` / `wt-stack.down` / `wt-stack.info` / `wt-stack.seed`.

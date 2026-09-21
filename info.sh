@@ -42,3 +42,11 @@ for project in $projects; do
   echo "-- project=$project containers --"
   docker ps -a --filter "label=com.docker.compose.project=$project" --format 'table {{.Names}}\t{{.Status}}' || true
 done
+
+echo ""
+echo "Supported actions: wt-stack.up, wt-stack.down, wt-stack.info, wt-stack.seed"
+echo "Supported environment variables:"
+echo "  WT_SEED=0|1               Disable/enable automatic data seeding on first mount (default: 1)"
+echo "  WT_SEED_TARGETS=\"...\"     Whitespace-separated targets (default: \"postgres redis minio\")"
+echo "  WT_SEED_FORCE=1           Force re-seeding even if destination data exists"
+echo "  WT_SEED_TIMEOUT=300       Timeout per service in seconds (default: 300)"

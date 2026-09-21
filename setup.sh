@@ -35,7 +35,9 @@
 #      Host() rule in the compose (prefers display_svc, falls back to first
 #      http route). If neither APP_HOST nor any route found -> hard error.
 #      URL = `https://foo-<tag>.domain`, printed as `wt-stack: URL=...`.
-#   7. Safety warnings (docker.sock/host-device/absolute binds), gentle orphan
+#   7. Seed dev data (postgres/redis/minio) from origin stack (seed.sh) when
+#      destination services are empty and WT_SEED != 0.
+#   8. Safety warnings (docker.sock/host-device/absolute binds), gentle orphan
 #      pre-clean (exited/dead containers + zero-attached networks of THIS
 #      project), then SINGLE-FILE up:
 #      `docker compose --project-name "$project" -f compose.worktree.yml up -d
@@ -239,7 +241,7 @@ wt_trace "=== wt-stack setup start project=$project tag=$tag worktree=$DIR build
 # edits (the copied main .env carries production secrets).
 ENV_FILE="$DIR/.env"
 MAIN_ENV="$main_path/.env"
-wt_step 1 8 "env + gitignored runtime files (.env, certs, secrets)"
+wt_step 1 9 "env + gitignored runtime files (.env, certs, secrets)"
 if [ ! -f "$ENV_FILE" ] && [ -f "$MAIN_ENV" ]; then
   cp "$MAIN_ENV" "$ENV_FILE"
   wt_note "copied .env from main checkout — check/adjust worktree-specific values"
@@ -492,7 +494,7 @@ fi
 # local builds, traefik labels stripped + re-keyed (http AND tcp), ports
 # removed, explicit volumes/networks renamed.
 GEN_PY="$SELF_DIR/gen-compose.py"
-wt_step 2 8 "generate compose.worktree.yml (gen-compose.py)"
+wt_step 2 9 "generate compose.worktree.yml (gen-compose.py)"
 wt_run "gen-compose.py" python3 "$GEN_PY" "$project" "$tag" "$OVERRIDE" <<PY || true
 $COMPOSE_DUMP
 PY
@@ -510,7 +512,7 @@ elif [ ! -f "$DIR/.gitignore" ]; then
   echo "wt-stack: created .gitignore with compose.worktree.yml"
 fi
 # validate BEFORE up — abort with clear error on malformed output
-wt_step 3 8 "validate compose.worktree.yml"
+wt_step 3 9 "validate compose.worktree.yml"
 if ! ( cd "$DIR" && docker compose -f compose.worktree.yml config >/dev/null 2>>"$LOG_FILE" ); then
   wt_fail "generated compose.worktree.yml does not parse — abort (check base compose; log: $LOG_FILE)"
   exit 1
@@ -518,7 +520,7 @@ fi
 wt_ok "compose.worktree.yml parses"
 
 # --- APP_HOST rewrite in .env (wt_host — append: host-<tag>.domain) ----------
-wt_step 4 8 "APP_HOST rewrite in .env (wt_host append)"
+wt_step 4 9 "APP_HOST rewrite in .env (wt_host append)"
 FINAL_HOST=""
 ENV_HOST_ORIG=""
 if [ -f "$ENV_FILE" ] && grep -q '^APP_HOST=' "$ENV_FILE"; then
@@ -702,7 +704,7 @@ PY
 # --- orphan pre-clean (this project only, gentle) -----------------------------
 # Stale exited/dead containers + networks with zero attached containers from
 # interrupted runs — NEVER a running container or an in-use network.
-wt_step 5 8 "pre-clean orphan containers/networks (project-only)"
+wt_step 5 9 "pre-clean orphan containers/networks (project-only)"
 for id in $(docker ps -aq --filter "status=exited" --filter "status=dead" --filter "label=com.docker.compose.project=$project" 2>/dev/null || true); do
   docker rm "$id" >/dev/null 2>&1 || true
   wt_trace "removed stale container $id"
@@ -721,12 +723,22 @@ done
 up_cmd=(docker compose --project-name "$project" -f compose.worktree.yml up -d)
 [ "${#build_args[@]}" -gt 0 ] && up_cmd+=("${build_args[@]}")
 
-wt_step 6 8 "up stack (docker compose up -d) — build/verbose log -> $LOG_FILE"
+wt_step 6 9 "up stack (docker compose up -d) — build/verbose log -> $LOG_FILE"
 
 if [ "$DRY" = "1" ]; then
   echo "wt-stack: WT_DRY_RUN=1 — would run:"
   echo "  cd $DIR && ${up_cmd[*]}"
   [ -n "$FINAL_HOST" ] && echo "wt-stack: URL=https://$FINAL_HOST"
+  wt_step 7 9 "seed dev data from origin stack (seed.sh)"
+  if [ "${WT_SEED:-1}" != "0" ]; then
+    SEED_SH="$SELF_DIR/seed.sh"
+    if [ -f "$SEED_SH" ]; then
+      wt_trace "invoking seed.sh (dry-run) --cwd $DIR --project $project --main $main_path"
+      WT_DRY_RUN=1 bash "$SEED_SH" --cwd "$DIR" --project "$project" --main "$main_path" || true
+    fi
+  else
+    wt_note "seed disabled (WT_SEED=0)"
+  fi
   exit 0
 fi
 
@@ -746,6 +758,27 @@ if [ "$n" -gt 0 ]; then
   [ -n "$FINAL_HOST" ] && echo "wt-stack: URL=https://$FINAL_HOST"
   [ -n "$ENV_HASH" ] && printf '%s' "$ENV_HASH" > "$ENV_HASH_FILE"
 
+  # --- worktree seed: seed dev data (postgres/redis/minio) from origin stack --
+  # Seeds data from the main checkout's stack on first mount when destination
+  # services are empty. Can be forced manually via action wt-stack.seed.
+  # Non-fatal: failures warn and log, but never abort stack setup.
+  wt_step 7 9 "seed dev data from origin stack (seed.sh)"
+  if [ "${WT_SEED:-1}" != "0" ]; then
+    SEED_SH="$SELF_DIR/seed.sh"
+    if [ -f "$SEED_SH" ]; then
+      wt_trace "invoking seed.sh --cwd $DIR --project $project --main $main_path"
+      if [ "$DRY" = "1" ]; then
+        WT_DRY_RUN=1 bash "$SEED_SH" --cwd "$DIR" --project "$project" --main "$main_path" || true
+      else
+        bash "$SEED_SH" --cwd "$DIR" --project "$project" --main "$main_path" || true
+      fi
+    else
+      wt_note "WARN seed.sh not found at $SEED_SH (skip seed)"
+    fi
+  else
+    wt_note "seed disabled (WT_SEED=0)"
+  fi
+
   # --- worktree orchestrator: tag-scoped isolation override + up --------------
   # Some app repos ship their own orchestrator compose (`docker-compose.orchestrator.yml`
   # + an overlay). Those overlays historically use GLOBAL FIXED names
@@ -757,7 +790,7 @@ if [ "$n" -gt 0 ]; then
   # BACKEND_WS_URL / ORCHESTRATOR_CONNECT_TOKEN), validate, then up it INSIDE
   # the worktree dir — teardown.sh's label resolution (working_dir) picks it up
   # automatically. Escape hatch: WT_NO_ORCHESTRATOR=1 skips entirely.
-  wt_step 7 8 "orchestrator isolate override + up"
+  wt_step 8 9 "orchestrator isolate override + up"
   ORCH_BASE="$DIR/docker-compose.orchestrator.yml"
   ORCH_OVERLAY="$DIR/compose.worktree.orchestrator.yml"
   ORCH_ISOLATE="$DIR/compose.worktree.orchestrator.$tag.yml"
@@ -905,7 +938,7 @@ PY
   # Probe the worktree URL via HTTPS; LE issuance may still be in progress on
   # first deploy — retry up to 6 times (~30s total). Success -> OK; failure ->
   # WARN with host + curl exit code + hint. NEVER blocks the script (exit 0).
-  wt_step 8 8 "TLS probe (non-blocking)"
+  wt_step 9 9 "TLS probe (non-blocking)"
   if [ -n "$FINAL_HOST" ]; then
     _tls_ok=0
     for _attempt in 1 2 3 4 5 6; do
