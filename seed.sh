@@ -129,28 +129,31 @@ find_src_container() {
 
 # --- Service: Postgres ---
 seed_postgres() {
-  set -euo pipefail
   local src_cid="$1"
   local dst_name="$2"
 
   wt_note "seeding postgres: source=$src_cid -> dest=$dst_name"
 
-  # Discover credentials from containers
+  # Discover credentials from source container
   local src_user src_db dst_user dst_db
-  src_user="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$src_cid" 2>/dev/null | awk -F= '$1=="POSTGRES_USER"{print $2; exit}')"
-  src_db="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$src_cid" 2>/dev/null | awk -F= '$1=="POSTGRES_DB"{print $2; exit}')"
-  dst_user="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$dst_name" 2>/dev/null | awk -F= '$1=="POSTGRES_USER"{print $2; exit}')"
-  dst_db="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$dst_name" 2>/dev/null | awk -F= '$1=="POSTGRES_DB"{print $2; exit}')"
+  src_user="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$src_cid" 2>/dev/null | awk -F= '$1=="POSTGRES_USER"{print $2; exit}' || true)"
+  src_db="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$src_cid" 2>/dev/null | awk -F= '$1=="POSTGRES_DB"{print $2; exit}' || true)"
 
   src_user="${src_user:-postgres}"
   src_db="${src_db:-${src_user}}"
-  dst_user="${dst_user:-$src_user}"
-  dst_db="${dst_db:-$src_db}"
 
   if [ "$DRY" = "1" ]; then
+    dst_user="${dst_user:-$src_user}"
+    dst_db="${dst_db:-$src_db}"
     wt_note "WT_DRY_RUN=1 — would dump $src_cid (db=$src_db, user=$src_user) and restore into $dst_name (db=$dst_db, user=$dst_user)"
     return 0
   fi
+
+  # In live run, inspect destination container
+  dst_user="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$dst_name" 2>/dev/null | awk -F= '$1=="POSTGRES_USER"{print $2; exit}' || true)"
+  dst_db="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$dst_name" 2>/dev/null | awk -F= '$1=="POSTGRES_DB"{print $2; exit}' || true)"
+  dst_user="${dst_user:-$src_user}"
+  dst_db="${dst_db:-$src_db}"
 
   # Readiness probe destination (poll 30s)
   local ready=0
@@ -168,12 +171,14 @@ seed_postgres() {
   fi
 
   # Empty-check (unless force)
+  # Measure user tables in public schema in app DB, NOT pg_database catalog
   if [ "$FORCE" -eq 0 ]; then
     local count
-    count="$(docker exec "$dst_name" psql -U "$dst_user" -tA -c "SELECT count(*) FROM pg_database WHERE datname NOT IN ('postgres','template0','template1');" 2>/dev/null || echo "-1")"
+    count="$(docker exec "$dst_name" psql -U "$dst_user" -d "$dst_db" -tA -c "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';" 2>/dev/null || echo "-1")"
     count="$(printf '%s' "$count" | tr -d '[:space:]')"
-    if [ "$count" != "0" ]; then
-      wt_note "postgres seed skipped (dados não vazios, count=$count)"
+    wt_trace "postgres empty check (SELECT count(*) FROM information_schema.tables WHERE table_schema='public' on db=$dst_db): count=$count"
+    if [ "$count" != "0" ] && [ "$count" != "-1" ]; then
+      wt_note "postgres seed skipped (dados não vazios, user tables=$count in db=$dst_db)"
       return 0
     fi
   fi
@@ -202,11 +207,15 @@ seed_postgres() {
 
 # --- Service: Redis ---
 seed_redis() {
-  set -euo pipefail
   local src_cid="$1"
   local dst_name="$2"
 
   wt_note "seeding redis: source=$src_cid -> dest=$dst_name"
+
+  if [ "$DRY" = "1" ]; then
+    wt_note "WT_DRY_RUN=1 — would BGSAVE on $src_cid, stop $dst_name, copy dump.rdb to destination volume, and start $dst_name"
+    return 0
+  fi
 
   # Verify destination has a volume declared
   local dst_vol
@@ -218,18 +227,13 @@ seed_redis() {
 
   # Extract password if present
   local src_pass dst_pass
-  src_pass="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$src_cid" 2>/dev/null | awk -F= '$1=="REDIS_PASSWORD"{print $2; exit}')"
-  dst_pass="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$dst_name" 2>/dev/null | awk -F= '$1=="REDIS_PASSWORD"{print $2; exit}')"
+  src_pass="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$src_cid" 2>/dev/null | awk -F= '$1=="REDIS_PASSWORD"{print $2; exit}' || true)"
+  dst_pass="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$dst_name" 2>/dev/null | awk -F= '$1=="REDIS_PASSWORD"{print $2; exit}' || true)"
 
   local src_cli=(docker exec "$src_cid" redis-cli)
   [ -n "$src_pass" ] && src_cli+=(-a "$src_pass")
   local dst_cli=(docker exec "$dst_name" redis-cli)
   [ -n "$dst_pass" ] && dst_cli+=(-a "$dst_pass")
-
-  if [ "$DRY" = "1" ]; then
-    wt_note "WT_DRY_RUN=1 — would BGSAVE on $src_cid, stop $dst_name, copy dump.rdb to volume $dst_vol, and start $dst_name"
-    return 0
-  fi
 
   # Readiness probe destination (poll 30s)
   local ready=0
@@ -250,7 +254,8 @@ seed_redis() {
   if [ "$FORCE" -eq 0 ]; then
     local dbsize
     dbsize="$("${dst_cli[@]}" DBSIZE 2>/dev/null | tr -d '[:space:]' || echo "-1")"
-    if [ "$dbsize" != "0" ] && [ "$dbsize" != ":0" ]; then
+    wt_trace "redis empty check (DBSIZE): dbsize=$dbsize"
+    if [ "$dbsize" != "0" ] && [ "$dbsize" != ":0" ] && [ "$dbsize" != "-1" ]; then
       wt_note "redis seed skipped (dados não vazios, dbsize=$dbsize)"
       return 0
     fi
@@ -258,14 +263,14 @@ seed_redis() {
 
   # BGSAVE on source and poll LASTSAVE until changed
   local baseline_save
-  baseline_save="$("${src_cli[@]}" LASTSAVE 2>/dev/null | tr -d '[:space:]')"
+  baseline_save="$("${src_cli[@]}" LASTSAVE 2>/dev/null | tr -d '[:space:]' || true)"
   "${src_cli[@]}" BGSAVE >> "$LOG_FILE" 2>&1 || true
 
   local save_ok=0
   for _ in $(seq 1 30); do
     local cur_save
-    cur_save="$("${src_cli[@]}" LASTSAVE 2>/dev/null | tr -d '[:space:]')"
-    if [ -n "$cur_save" ] && [ -n "$baseline_save" ] && [ "$cur_save" -gt "$baseline_save" ]; then
+    cur_save="$("${src_cli[@]}" LASTSAVE 2>/dev/null | tr -d '[:space:]' || true)"
+    if [ -n "$cur_save" ] && [ -n "$baseline_save" ] && [ "$cur_save" -gt "$baseline_save" ] 2>/dev/null; then
       save_ok=1
       break
     fi
@@ -279,7 +284,7 @@ seed_redis() {
   # Read source dump.rdb directly from container
   # Redis destination MUST be stopped before replacing dump.rdb
   wt_note "stopping destination $dst_name for RDB restore"
-  docker stop "$dst_name" >> "$LOG_FILE" 2>&1
+  docker stop "$dst_name" >> "$LOG_FILE" 2>&1 || true
 
   # Stream dump.rdb from source container into destination volume using alpine helper
   local copy_rc=0
@@ -287,7 +292,7 @@ seed_redis() {
     docker run --rm -i -v "$dst_vol:/data" alpine:3 sh -c 'cat > /data/dump.rdb' >> "$LOG_FILE" 2>&1 || copy_rc=$?
 
   wt_note "restarting destination $dst_name"
-  docker start "$dst_name" >> "$LOG_FILE" 2>&1
+  docker start "$dst_name" >> "$LOG_FILE" 2>&1 || true
 
   if [ "$copy_rc" -eq 0 ]; then
     wt_ok "redis seeded successfully (RDB copied to volume $dst_vol)"
@@ -300,41 +305,17 @@ seed_redis() {
 
 # --- Service: MinIO ---
 seed_minio() {
-  set -euo pipefail
   local src_cid="$1"
   local dst_name="$2"
 
   wt_note "seeding minio: source=$src_cid -> dest=$dst_name"
 
-  # Find minio credentials and ports
+  # Find minio credentials and endpoints from source
   local src_user src_pass dst_user dst_pass
-  src_user="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$src_cid" 2>/dev/null | awk -F= '$1=="MINIO_ROOT_USER"{print $2; exit}')"
-  src_pass="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$src_cid" 2>/dev/null | awk -F= '$1=="MINIO_ROOT_PASSWORD"{print $2; exit}')"
-  dst_user="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$dst_name" 2>/dev/null | awk -F= '$1=="MINIO_ROOT_USER"{print $2; exit}')"
-  dst_pass="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$dst_name" 2>/dev/null | awk -F= '$1=="MINIO_ROOT_PASSWORD"{print $2; exit}')"
-
+  src_user="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$src_cid" 2>/dev/null | awk -F= '$1=="MINIO_ROOT_USER"{print $2; exit}' || true)"
+  src_pass="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$src_cid" 2>/dev/null | awk -F= '$1=="MINIO_ROOT_PASSWORD"{print $2; exit}' || true)"
   src_user="${src_user:-minioadmin}"
   src_pass="${src_pass:-minioadmin}"
-  dst_user="${dst_user:-$src_user}"
-  dst_pass="${dst_pass:-$src_pass}"
-
-  # Networks to join helper container
-  local src_net dst_net
-  src_net="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{println $k}}{{end}}' "$src_cid" 2>/dev/null | head -n 1)"
-  dst_net="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{println $k}}{{end}}' "$dst_name" 2>/dev/null | head -n 1)"
-
-  if [ -z "$src_net" ] || [ -z "$dst_net" ]; then
-    wt_fail "unable to determine network for minio containers"
-    return 1
-  fi
-
-  # Source IP/address and destination IP/address
-  local src_ip dst_ip
-  src_ip="$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{println}}{{end}}" "$src_cid" 2>/dev/null | grep -v '^$' | head -n 1)"
-  dst_ip="$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{println}}{{end}}" "$dst_name" 2>/dev/null | grep -v '^$' | head -n 1)"
-
-  local src_endpoint="http://${src_ip}:9000"
-  local dst_endpoint="http://${dst_ip}:9000"
 
   # Prefer local minio/mc image if present, otherwise quay.io/minio/mc:latest
   local mc_image="minio/mc:latest"
@@ -343,15 +324,43 @@ seed_minio() {
   fi
 
   if [ "$DRY" = "1" ]; then
-    wt_note "WT_DRY_RUN=1 — would mirror minio from $src_endpoint to $dst_endpoint via $mc_image"
+    wt_note "WT_DRY_RUN=1 — would mirror minio from $src_cid to $dst_name via $mc_image"
     return 0
   fi
 
-  # Readiness check on destination minio (up to 30s)
+  dst_user="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$dst_name" 2>/dev/null | awk -F= '$1=="MINIO_ROOT_USER"{print $2; exit}' || true)"
+  dst_pass="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$dst_name" 2>/dev/null | awk -F= '$1=="MINIO_ROOT_PASSWORD"{print $2; exit}' || true)"
+  dst_user="${dst_user:-$src_user}"
+  dst_pass="${dst_pass:-$src_pass}"
+
+  # Networks to join helper container
+  local src_net dst_net
+  src_net="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{println $k}}{{end}}' "$src_cid" 2>/dev/null | head -n 1 || true)"
+  dst_net="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{println $k}}{{end}}' "$dst_name" 2>/dev/null | head -n 1 || true)"
+
+  if [ -z "$src_net" ] || [ -z "$dst_net" ]; then
+    wt_fail "unable to determine network for minio containers"
+    return 1
+  fi
+
+  # Source IP/address and destination IP/address
+  local src_ip dst_ip
+  src_ip="$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{println}}{{end}}" "$src_cid" 2>/dev/null | grep -v '^$' | head -n 1 || true)"
+  dst_ip="$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{println}}{{end}}" "$dst_name" 2>/dev/null | grep -v '^$' | head -n 1 || true)"
+
+  if [ -z "$src_ip" ] || [ -z "$dst_ip" ]; then
+    wt_fail "unable to determine IP address for minio containers"
+    return 1
+  fi
+
+  local src_endpoint="http://${src_ip}:9000"
+  local dst_endpoint="http://${dst_ip}:9000"
+
+  # Readiness check on destination minio (up to 30s) using --entrypoint /bin/sh
   local ready=0
   for _ in $(seq 1 30); do
-    if docker run --rm --network "$dst_net" "$mc_image" \
-       alias set dst "$dst_endpoint" "$dst_user" "$dst_pass" >/dev/null 2>&1; then
+    if docker run --rm --network "$dst_net" --entrypoint /bin/sh "$mc_image" -c \
+       "mc alias set dst '$dst_endpoint' '$dst_user' '$dst_pass' --no-color >/dev/null 2>&1 && mc admin info dst --no-color >/dev/null 2>&1"; then
       ready=1
       break
     fi
@@ -363,32 +372,39 @@ seed_minio() {
     return 1
   fi
 
-  # Empty-check (unless force): no buckets in dst
+  # Empty-check (unless force): check if any buckets exist on destination
   if [ "$FORCE" -eq 0 ]; then
-    local buckets
-    buckets="$(docker run --rm --network "$dst_net" "$mc_image" sh -c \
-      "mc alias set dst '$dst_endpoint' '$dst_user' '$dst_pass' >/dev/null 2>&1 && mc ls dst" 2>/dev/null || true)"
-    if [ -n "$(printf '%s' "$buckets" | tr -d '[:space:]')" ]; then
-      wt_note "minio seed skipped (dados não vazios)"
+    local bucket_count
+    bucket_count="$(docker run --rm --network "$dst_net" --entrypoint /bin/sh "$mc_image" -c \
+      "mc alias set dst '$dst_endpoint' '$dst_user' '$dst_pass' --no-color >/dev/null 2>&1 && mc ls dst --no-color 2>/dev/null | grep -c '/$' || true" 2>/dev/null || echo "-1")"
+    bucket_count="$(printf '%s' "$bucket_count" | tr -d '[:space:]')"
+    wt_trace "minio empty check: bucket_count=$bucket_count"
+    if [ "$bucket_count" != "0" ] && [ "$bucket_count" != "-1" ]; then
+      wt_note "minio seed skipped (dados não vazios, buckets=$bucket_count)"
       return 0
     fi
   fi
 
-  # To mirror between networks: create transient container on src_net, connect to dst_net, then run mirror
+  # Transient mirror container across both networks
   local helper_id
-  helper_id="$(docker create --rm --network "$src_net" "$mc_image" sh -c "
-    mc alias set src '$src_endpoint' '$src_user' '$src_pass' >/dev/null 2>&1 && \
-    mc alias set dst '$dst_endpoint' '$dst_user' '$dst_pass' >/dev/null 2>&1 && \
+  helper_id="$(docker create --rm --network "$src_net" --entrypoint /bin/sh "$mc_image" -c "
+    mc alias set src '$src_endpoint' '$src_user' '$src_pass' --no-color >/dev/null 2>&1 && \
+    mc alias set dst '$dst_endpoint' '$dst_user' '$dst_pass' --no-color >/dev/null 2>&1 && \
     mc mirror --overwrite --parallel 4 src/ dst/
   ")"
+
+  if [ -z "$helper_id" ]; then
+    wt_fail "could not create minio helper container"
+    return 1
+  fi
 
   if [ "$src_net" != "$dst_net" ]; then
     docker network connect "$dst_net" "$helper_id" >> "$LOG_FILE" 2>&1 || true
   fi
 
   # Run mirror under timeout
-  timeout "$TIMEOUT_SEC" docker start -a "$helper_id" >> "$LOG_FILE" 2>&1
-  local rc=$?
+  local rc=0
+  timeout "$TIMEOUT_SEC" docker start -a "$helper_id" >> "$LOG_FILE" 2>&1 || rc=$?
 
   if [ "$rc" -eq 0 ]; then
     wt_ok "minio seeded successfully (buckets mirrored)"
@@ -411,7 +427,7 @@ for svc in "${VALID_TARGETS[@]}"; do
   # Check source container
   src_cid="$(find_src_container "$svc")"
   if [ -z "$src_cid" ]; then
-    wt_note "source container for service '$svc' not running on $MAIN_PATH (skip)"
+    wt_fail "source container for service '$svc' not running on $MAIN_PATH (skip)"
     continue
   fi
 
