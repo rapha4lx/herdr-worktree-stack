@@ -86,8 +86,8 @@ dev data from the ORIGIN checkout's running stack (`main_path`).
 - **Pipes & Non-destructive**:
   - `postgres`: `pg_dump -Fc` on origin piped directly into `pg_restore` on worktree destination.
   - `redis`: `BGSAVE` on origin (never blocks event loop), polls `LASTSAVE`, stops worktree redis container, copies `dump.rdb` into destination volume, restarts destination.
-  - `minio`: transient `minio/mc` mirror container attached to both project networks.
-- **Empty-check**: By default, seeding skips if destination already contains data.
+  - `minio`: transient `minio/mc` mirror container (`mc mirror --overwrite --max-workers 4`) attached to both project networks.
+- **Empty-check**: Seeding decisions use per-volume `.wt-seed-done` markers, race-proof against database migrations/cache writes on initial boot. Skips if `.wt-seed-done` is present (unless `--force`).
 - **Non-fatal**: Any failure in seeding logs a warning and exits 0; the worktree stack remains usable.
 
 ### Configuration & Control Variables

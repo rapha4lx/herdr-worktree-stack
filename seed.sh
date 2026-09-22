@@ -4,6 +4,9 @@
 # Called automatically by setup.sh on mount when WT_SEED!=0 and data is empty,
 # or manually via action wt-stack.seed (--force).
 #
+# Seeding decision is per-volume marker-based (.wt-seed-done), race-proof and
+# independent of bootstrap table migrations or initial cache writes.
+#
 # Arguments:
 #   --cwd <dir>        Worktree checkout directory (required)
 #   --project <name>   Docker compose project name for worktree (required)
@@ -145,7 +148,8 @@ seed_postgres() {
   if [ "$DRY" = "1" ]; then
     dst_user="${dst_user:-$src_user}"
     dst_db="${dst_db:-$src_db}"
-    wt_note "WT_DRY_RUN=1 — would dump $src_cid (db=$src_db, user=$src_user) and restore into $dst_name (db=$dst_db, user=$dst_user)"
+    wt_note "WT_DRY_RUN=1 — would check marker \$PGDATA/.wt-seed-done on $dst_name"
+    wt_note "WT_DRY_RUN=1 — would dump $src_cid (db=$src_db, user=$src_user), restore into $dst_name (db=$dst_db, user=$dst_user), and touch \$PGDATA/.wt-seed-done"
     return 0
   fi
 
@@ -170,15 +174,15 @@ seed_postgres() {
     return 1
   fi
 
-  # Empty-check (unless force)
-  # Measure user tables in public schema in app DB, NOT pg_database catalog
+  # Marker-based empty check (unless force)
+  # Fresh volume = no .wt-seed-done. Present = already seeded.
+  local pgdata
+  pgdata="$(docker exec "$dst_name" printenv PGDATA 2>/dev/null || true)"
+  pgdata="${pgdata:-/var/lib/postgresql/data}"
+
   if [ "$FORCE" -eq 0 ]; then
-    local count
-    count="$(docker exec "$dst_name" psql -U "$dst_user" -d "$dst_db" -tA -c "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';" 2>/dev/null || echo "-1")"
-    count="$(printf '%s' "$count" | tr -d '[:space:]')"
-    wt_trace "postgres empty check (SELECT count(*) FROM information_schema.tables WHERE table_schema='public' on db=$dst_db): count=$count"
-    if [ "$count" != "0" ] && [ "$count" != "-1" ]; then
-      wt_note "postgres seed skipped (dados não vazios, user tables=$count in db=$dst_db)"
+    if docker exec "$dst_name" sh -c "test -f '$pgdata/.wt-seed-done'" >/dev/null 2>&1; then
+      wt_note "postgres seed skipped (já semeado, marker $pgdata/.wt-seed-done presente)"
       return 0
     fi
   fi
@@ -197,6 +201,7 @@ seed_postgres() {
   local rc=$?
   # pg_restore returns 0 on success, or 1 on non-fatal warnings (e.g. relation already exists, role not found)
   if [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ]; then
+    docker exec "$dst_name" sh -c "touch '$pgdata/.wt-seed-done'" >> "$LOG_FILE" 2>&1 || true
     wt_ok "postgres seeded successfully (db=$dst_db)"
     return 0
   else
@@ -213,16 +218,28 @@ seed_redis() {
   wt_note "seeding redis: source=$src_cid -> dest=$dst_name"
 
   if [ "$DRY" = "1" ]; then
-    wt_note "WT_DRY_RUN=1 — would BGSAVE on $src_cid, stop $dst_name, copy dump.rdb to destination volume, and start $dst_name"
+    wt_note "WT_DRY_RUN=1 — would check marker /data/.wt-seed-done on destination volume"
+    wt_note "WT_DRY_RUN=1 — would BGSAVE on $src_cid, stop $dst_name, copy dump.rdb to destination volume, start $dst_name, and touch marker /data/.wt-seed-done"
     return 0
   fi
 
   # Verify destination has a volume declared
-  local dst_vol
+  local dst_vol dst_mount
   dst_vol="$(docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{end}}{{end}}' "$dst_name" 2>/dev/null || true)"
+  dst_mount="$(docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{.Destination}}{{end}}{{end}}' "$dst_name" 2>/dev/null || true)"
+  dst_mount="${dst_mount:-/data}"
+
   if [ -z "$dst_vol" ]; then
     wt_note "destination redis ($dst_name) has no volume declared (skip seed)"
     return 0
+  fi
+
+  # Marker-based empty check (unless force)
+  if [ "$FORCE" -eq 0 ]; then
+    if docker exec "$dst_name" sh -c "test -f '$dst_mount/.wt-seed-done'" >/dev/null 2>&1; then
+      wt_note "redis seed skipped (já semeado, marker $dst_mount/.wt-seed-done presente)"
+      return 0
+    fi
   fi
 
   # Extract password if present
@@ -248,17 +265,6 @@ seed_redis() {
   if [ "$ready" -ne 1 ]; then
     wt_fail "destination redis ($dst_name) not ready after 30s"
     return 1
-  fi
-
-  # Empty-check (unless force)
-  if [ "$FORCE" -eq 0 ]; then
-    local dbsize
-    dbsize="$("${dst_cli[@]}" DBSIZE 2>/dev/null | tr -d '[:space:]' || echo "-1")"
-    wt_trace "redis empty check (DBSIZE): dbsize=$dbsize"
-    if [ "$dbsize" != "0" ] && [ "$dbsize" != ":0" ] && [ "$dbsize" != "-1" ]; then
-      wt_note "redis seed skipped (dados não vazios, dbsize=$dbsize)"
-      return 0
-    fi
   fi
 
   # BGSAVE on source and poll LASTSAVE until changed
@@ -289,7 +295,7 @@ seed_redis() {
   # Stream dump.rdb from source container into destination volume using alpine helper
   local copy_rc=0
   docker exec "$src_cid" cat /data/dump.rdb 2>/dev/null | \
-    docker run --rm -i -v "$dst_vol:/data" alpine:3 sh -c 'cat > /data/dump.rdb' >> "$LOG_FILE" 2>&1 || copy_rc=$?
+    docker run --rm -i -v "$dst_vol:/data" alpine:3 sh -c 'cat > /data/dump.rdb && touch /data/.wt-seed-done' >> "$LOG_FILE" 2>&1 || copy_rc=$?
 
   wt_note "restarting destination $dst_name"
   docker start "$dst_name" >> "$LOG_FILE" 2>&1 || true
@@ -324,8 +330,22 @@ seed_minio() {
   fi
 
   if [ "$DRY" = "1" ]; then
-    wt_note "WT_DRY_RUN=1 — would mirror minio from $src_cid to $dst_name via $mc_image"
+    wt_note "WT_DRY_RUN=1 — would check marker /data/.wt-seed-done on $dst_name"
+    wt_note "WT_DRY_RUN=1 — would mirror minio from $src_cid to $dst_name via $mc_image and touch /data/.wt-seed-done"
     return 0
+  fi
+
+  # Destination data dir for marker check
+  local dst_datadir
+  dst_datadir="$(docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{.Destination}}{{end}}{{end}}' "$dst_name" 2>/dev/null | head -n 1 || true)"
+  dst_datadir="${dst_datadir:-/data}"
+
+  # Marker-based empty check (unless force)
+  if [ "$FORCE" -eq 0 ]; then
+    if docker exec "$dst_name" sh -c "test -f '$dst_datadir/.wt-seed-done'" >/dev/null 2>&1; then
+      wt_note "minio seed skipped (já semeado, marker $dst_datadir/.wt-seed-done presente)"
+      return 0
+    fi
   fi
 
   dst_user="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$dst_name" 2>/dev/null | awk -F= '$1=="MINIO_ROOT_USER"{print $2; exit}' || true)"
@@ -372,25 +392,12 @@ seed_minio() {
     return 1
   fi
 
-  # Empty-check (unless force): check if any buckets exist on destination
-  if [ "$FORCE" -eq 0 ]; then
-    local bucket_count
-    bucket_count="$(docker run --rm --network "$dst_net" --entrypoint /bin/sh "$mc_image" -c \
-      "mc alias set dst '$dst_endpoint' '$dst_user' '$dst_pass' --no-color >/dev/null 2>&1 && mc ls dst --no-color 2>/dev/null | grep -c '/$' || true" 2>/dev/null || echo "-1")"
-    bucket_count="$(printf '%s' "$bucket_count" | tr -d '[:space:]')"
-    wt_trace "minio empty check: bucket_count=$bucket_count"
-    if [ "$bucket_count" != "0" ] && [ "$bucket_count" != "-1" ]; then
-      wt_note "minio seed skipped (dados não vazios, buckets=$bucket_count)"
-      return 0
-    fi
-  fi
-
   # Transient mirror container across both networks
   local helper_id
   helper_id="$(docker create --rm --network "$src_net" --entrypoint /bin/sh "$mc_image" -c "
     mc alias set src '$src_endpoint' '$src_user' '$src_pass' --no-color >/dev/null 2>&1 && \
     mc alias set dst '$dst_endpoint' '$dst_user' '$dst_pass' --no-color >/dev/null 2>&1 && \
-    mc mirror --overwrite --parallel 4 src/ dst/
+    mc mirror --overwrite --max-workers 4 src/ dst/
   ")"
 
   if [ -z "$helper_id" ]; then
@@ -407,6 +414,7 @@ seed_minio() {
   timeout "$TIMEOUT_SEC" docker start -a "$helper_id" >> "$LOG_FILE" 2>&1 || rc=$?
 
   if [ "$rc" -eq 0 ]; then
+    docker exec "$dst_name" sh -c "touch '$dst_datadir/.wt-seed-done'" >> "$LOG_FILE" 2>&1 || true
     wt_ok "minio seeded successfully (buckets mirrored)"
     return 0
   else
